@@ -1,0 +1,22 @@
+# dsh-model-pool（fork of dsh-llm-fallbacks 0.6.5）的 profile-bundle patch：
+# 在 profile 的 bundle 栈上插入本插件的一行（dsh-base 在前，本 bundle 在
+# llm-retry bundle 之后；同名行后写的层覆盖先写的层）。
+#
+# 插入位置决定 host waterfall 的复合顺序：profile 必须让 llm-retry bundle
+# 排在 dsh-model-pool 之前，这样本插件的 `agent/request-error` 监听器组合在
+# llm-retry 之后——只有重试预算耗尽才介入（normal 模式），或在 always 模式下
+# 先向下游委派。
+#
+# patch 是整行替换语义：它替换目标行的整个 `config` 而不是逐字段合并，所以用
+# 户级 override 必须把它要保留的每个字段都重写一遍。这里只发布中性默认值
+# （空池 = 插件不生效）；profile 层（cordis.patch.yml）的 override 优先。
+#
+# 行 `id` 保持 `llm-fallbacks`：内部标识（settings 写入命名空间
+# `llm-fallbacks`、cordis 服务名、typert 端点 `dsh-model-pool#fallbacks/*`）
+# 全部沿用，只有包名与界面名称换成本 fork 的 `dsh-model-pool`。
+# 池子内容请在 GUI「模型池」卡片里编辑，或在本行的 config 下写 rootChain。
+
+- insert:
+    - id: llm-fallbacks
+      name: 'dsh-model-pool'
+      config: {}

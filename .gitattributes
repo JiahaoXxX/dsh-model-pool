@@ -1,0 +1,7 @@
+# Plugin bundles are shipped with LF line endings on purpose: the .d.ts and
+# bundle patch files are consumed by the host as-is, and CRLF in
+# bundle/cordis.patch.yml breaks the YAML block scalars.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.tgz binary

@@ -1,0 +1,8 @@
+node_modules/
+.backups/
+*.log
+*.tgz
+.pooltest/
+.verify/
+.DS_Store
+Thumbs.db

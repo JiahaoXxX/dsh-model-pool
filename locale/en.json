@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Model pool",
+    "description": "Define your own model pool: LLM requests walk the configured provider/model chain when they keep failing (auth, quota, rate limit). The ModelPool/Auto row in the model picker represents the whole pool. Any provider may head or tail the chain — no official-model requirement."
+  }
+}

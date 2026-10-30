@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "模型池",
+    "description": "自定义模型池：请求失败（认证、配额、限流）时自动沿池切换 provider/model；模型选择器中的 ModelPool/Auto 行即代表整个池。"
+  }
+}

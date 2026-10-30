@@ -1,0 +1,79 @@
+{
+  "name": "dsh-model-pool",
+  "description": "自定义模型池：任意 provider/model 组成降级链，请求失败（认证、配额、限流）时自动沿池切换；模型选择器可选 ModelPool/Auto（无官方模型链尾要求）",
+  "keywords": [
+    "dsh",
+    "dsh-plugin"
+  ],
+  "version": "0.1.1",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "default": "./dist/client/index.js"
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./bundle/cordis.patch.yml": "./bundle/cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "bundle",
+    "locale",
+    "icon.svg",
+    "PUBLISHING.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./bundle/cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-agent": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-api-gateway": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-api-remotes": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-api-session-controller": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-connection": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-locale": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-store": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-chat": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-plugin-manager": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-renderer": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-settings": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-commands": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm-retry": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-projection": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-settings": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-tool-subagent": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-typert-registry": "^0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "react": "^18.2.0"
+  }
+}
