@@ -156,6 +156,10 @@ Save the config and restart the session, then type `/fallbacks` — the read-onl
 - **Subagent role badge**: when a subagent is **dispatched with a declared role** — the `**Execute as**: <id>` field of its Assignment, the same declaration that carries the persona, and the badge's ONLY source (policy on or off) — its session shows a compact role badge next to the session's agent-preset (mode) chip in the web session header; hover shows `role → latest request route` (the route of the newest recorded request, not the dispatch-time route). Only the DECLARED header is read, so a child whose role came from another stage (`agentPreset` match, a role rule, or the LLM auto-match) but which declares no Assignment header is still routed as that role yet shows **no** badge — the badge never reports a role inferred after the fact. `inherit`/unresolved sessions render no badge. The badge is durable: it is read from the child's own session record, so it is still shown for a **settled** subagent session and **after a host restart**.
 - **Context-window-aware fallback**: `triggerCodes` accepts any dsh failure code, including `CONTEXT_WINDOW_EXCEEDED` — a request too big for the current model fails over to a candidate with a **larger** context window (candidates that cannot fit either are skipped), and because the route itself is healthy the switch is request-scoped: no cooldown, no half-open probe burned (see [Fallback triggers](#fallback-triggers-triggercodes)).
 - **Cooldown and revert**: failed / switched-away models are not re-selected during cooldown; `revertPolicy: cooldown-expiry` returns to the primary model automatically.
+- **Transient failures get a soft bench, and success releases it**: a failure the Harness itself calls retryable (`TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`, …) benches a route for one minute rather than the whole `cooldownMs`; a definite verdict (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `INVALID_API_KEY`, …) keeps the full window. Any completed answer from a benched route drops its bench immediately — in `timer` mode too, so a working provider is never stuck out the window (see [A transient failure gets a soft bench](#a-transient-failure-gets-a-soft-bench) and [A success releases the bench immediately](#a-success-releases-the-bench-immediately)).
+- **Manual choice wins**: a concrete model you picked yourself that is not the all-day chain head is left alone — its failures pass through to llm-retry / the original error with no switch, no cooldown and no retry override. Only the virtual `ModelPool/*` rows, the current chain head, and subagent dispatches are pool-owned (see [A manual model choice is never overridden](#a-manual-model-choice-is-never-overridden)).
+- **Reset cooldowns and connectivity test**: two buttons on every chain-status strip, scoped to the chain above them — one releases that chain's benches, the other probes that chain's routes with a one-token request and benches only the ones that answer with a definite provider-side failure, so a timeout or rate limit never buries a healthy source (see [Reset and connectivity test](#reset-and-connectivity-test)).
+- **Drag-and-drop priority**: chain rows carry a grip handle; the list order is the routing priority, on the root chain and on every named pool (see [Priority order is drag-and-drop](#priority-order-is-drag-and-drop)).
 - **Host subagent model policy (dsh 0.1.2)**: when the host `subagent-model-selection` policy is enabled, its allowlist is a hard constraint on every plugin-originated subagent route — an explicit authorized spawn route stays the chain head (role-inject skipped), inheritance inject heads and failure-switch targets are intersected with the effective allowlist, and an empty intersection skips the inject/switch (warn log + read-only card warning; no out-of-allowlist request is ever sent). A present-but-unreadable policy fails closed. Policy off/absent → inject and failure-switch selection exactly as 0.3.5. Override `reasoningEffort` follows the upstream routeChanged rule on every path (same route → keep; route change → drop unless explicit). See [Host subagent model policy](#host-subagent-model-policy-dsh-012).
 - **Half-open recovery (opt-in)**: `recovery: half-open` makes recovery evidence-driven — an expired cooldown leaves the route half-open for one logged probe instead of restoring the preference; consecutive failures escalate the suppression duration (×2 per failure, capped at 1 h); an observed completion closes the circuit and fully restores the preference. `revertPolicy: 'never'` keeps the mechanism inert; state is session-scoped in-memory (a restart resets). YAML-only — the default `timer` keeps every existing behavior byte-identical. Accepted values: `timer` (default) | `half-open`.
 - **Visible behavior**: every switch is recorded in an info-level log line (from/to/role/reason) — no silent model switching. The plugin writes **no** durable `fallbacks/switch` session events (issue #52: the apply()-time event-type registration was proven ineffective, and a session containing that event could refuse to load after a dsh restart). Sessions written by much older plugin versions may still contain such rows; this plugin neither writes nor repairs them.
@@ -235,6 +239,51 @@ Chain status                          In use: Qoder · dfmodel
 The strip refreshes every 5 seconds and after every settings change. It is strictly derived from the plugin's own observed request errors: the state is per-agent and never persisted, so a fresh session starts with no cooling entries. Providers do not publish a cross-plugin status API, so each provider's own status detection (WorkBuddy's account pool, Qoder's quota) stays inside that provider — the pool only learns about a failure when a request actually fails.
 
 The picker label follows the same state: a named pool renders `glm-5.3 → <the provider currently in use>`, and the label moves down the chain as soon as the head is benched.
+
+### Reset and connectivity test
+
+Every chain-status strip carries its own two buttons, and they act on **that chain only**: the default strip's buttons cover the root chain (or the time-slot chain currently in force), and each named pool's buttons cover that pool's chain.
+
+- **Reset cooldowns** (重置冷却) drops the benches that chain owns — per-agent cooldowns, half-open probe records, and benches discovered by a connectivity test — and re-reads the status. Use it after a provider outage you know has cleared, instead of waiting out `cooldownMs`. A route that also appears in another chain is released there too, because a bench belongs to the provider route rather than to the chain that happened to notice the failure.
+- **Test connectivity** (检测连通) sends a one-token request to each route of that chain and benches the ones that answer with a definite failure. A dead source is therefore out of the way before your next real request, instead of costing you a failed turn.
+
+Probing one chain never blocks another: each strip tracks its own run and keeps its own tally, so a long probe on `glm-5.3` leaves the default chain's buttons usable.
+
+A connectivity test is deliberately **conservative about what counts as evidence**. A timeout, an abort, a transport blip, or a rate limit says nothing about whether a route can serve, so benching on one would bury a healthy provider for the whole cooldown window. Such codes are retried once and, if still inconclusive, reported as *inconclusive* and **not benched**:
+
+```
+Tested 5 routes: 3 reachable, 1 benched, 1 inconclusive (not benched)
+```
+
+Only a provider-side verdict (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `INVALID_API_KEY`, `AUTH`, `PERMISSION_DENIED`, …) puts a route on a full cooldown. The full transient list is `TIMEOUT`, `ABORTED`, `TRANSPORT`, `NETWORK_ERROR`, `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, `EHOSTUNREACH`, `ENETUNREACH`, `RATE_LIMITED`, `RATE_LIMIT`, `RATE_LIMIT_EXCEEDED`, `TOO_MANY_REQUESTS`, `OVERLOADED`, `OVERLOADED_ERROR`, `UNAVAILABLE`, `SERVER`, `SERVER_ERROR`, `INTERNAL_ERROR`, `BAD_GATEWAY`, `SERVICE_UNAVAILABLE`, `UPSTREAM_TIMEOUT`, `UPSTREAM_ERROR`, `EMPTY_RESPONSE`, `ACCOUNT_SIGNED_OUT`. (`RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT` and `EMPTY_RESPONSE` are exactly the codes the Harness itself treats as retryable — `DEFAULT_RETRYABLE_CODES` in @deepseek-ai/dsh-llm.)
+
+Global benches use the same `cooldownMs` as route failures, so a probe result and a real failure age out together.
+
+### A transient failure gets a soft bench
+
+The same reasoning applies to failures you did not probe for — the ones the engine sees while routing a real request. A `TIMEOUT` or a `RATE_LIMIT` on the head is not evidence that the source is broken, so it earns a **soft bench of one minute**, not a full `cooldownMs`:
+
+- `TRANSIENT_BENCH_MS` is 60 s. A failure whose code is in the transient list above benches the route for `min(cooldownMs, 60 s)`, so shrinking `cooldownMs` below a minute also shrinks the soft bench.
+- Definite verdicts (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `INVALID_API_KEY`, `AUTH`, a rotated key, …) keep the full `cooldownMs` — retrying those in a minute would only burn another turn.
+- A request-scoped failure (`CONTEXT_WINDOW_EXCEEDED`) never touches the cooldown at all.
+- An always-mode retry-cap decision carries no failure code, so it keeps the full window.
+
+### A success releases the bench immediately
+
+A bench is not a promise to stay down. Whenever the plugin sees a completed assistant message from a route it has benched, that bench is dropped right away and the provider returns to the head of the chain on the next request. This works in `timer` mode too, not only with `recovery: "half-open"` — a real answer is proof the source is alive, and waiting out the remaining timer when you already have that proof is exactly the kind of misdiagnosis this avoids.
+
+`revertPolicy: "never"` is the exception: it is an explicit request to keep a failed entry out for the rest of the session, so a success does not override it.
+
+### Priority order is drag-and-drop
+
+Both the root chain and each named pool's chain are ordered lists, and the order *is* the priority: the first non-benched entry is what you get. Rows can be dragged by the grip handle on the left — pool cards by their header grip, chain entries by the grip in the entry footer — and the change is a normal unsaved edit, so it goes through the section's Save button like any other edit. Dragging is disabled while the settings are read-only.
+
+### A manual model choice is never overridden
+
+The pool engines act only on the routes they own. If you pick a **concrete** model in the picker that is not the head of the all-day chain, the plugin treats it as a deliberate manual choice and lets its failures pass straight through to llm-retry / the original error: no switch, no cooldown, no retry override. Backing off from a manual pick is exactly the hijack this behaviour removes.
+
+What still counts as pool-owned: the virtual `ModelPool/Auto` row and every `ModelPool/<pool id>` row (those *are* routing contracts, so failures there are what the engine is for), any concrete route that happens to be the current all-day chain head, and any subagent session (its route comes from role injection, not from a human click).
+
 
 ## Time-slot presets
 

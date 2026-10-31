@@ -1043,7 +1043,14 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/** Controller joining Settings reads, writes, and pushed invalidations. */
-		var FallbacksSettingsController = class {
+		/**
+	* Which chain a probe row came from. The host tags every row with its scope;
+	* an untagged row (an older host) belongs to the default chain.
+	*/
+	function cooldownRowScope(row) {
+		return row !== null && typeof row === "object" && typeof row.pool === "string" ? row.pool : "";
+	}
+	var FallbacksSettingsController = class {
 			api;
 			rpc;
 			/** Snapshot consumed by the section through `useSyncExternalStore`. */
@@ -1067,7 +1074,10 @@ window.__ModuleLoader__.load({
 				subagentPolicy: void 0,
 				cooldownStatus: "idle",
 				cooldownError: null,
-				cooldown: void 0
+				cooldown: void 0,
+				cooldownBusy: null,
+				cooldownBusyScope: "",
+				probeResults: []
 			});
 			/** Read guard: a newer load() supersedes an older one's publish. */
 			readGeneration = 0;
@@ -1306,6 +1316,70 @@ window.__ModuleLoader__.load({
 			* section's error banner and the form stays editable for retry (KD-G3).
 			* @param next - the complete edited configuration.
 			*/
+			async clearCooldowns(scope = "") {
+				const generation = ++this.cooldownGeneration;
+				this.store.update((state) => {
+					state.cooldownBusy = "clearing";
+					state.cooldownBusyScope = scope;
+				});
+				try {
+					const result = await this.rpc.call("/api", "fallbacks/clear-cooldowns", { args: { scope } });
+					if (generation !== this.cooldownGeneration) return;
+					if (!result.ok) throw result.error;
+					const parsed = parseCooldownWire(result.value);
+					this.store.update((state) => {
+						state.cooldownBusy = null;
+						state.cooldownBusyScope = "";
+						state.cooldownStatus = "ready";
+						state.cooldownError = null;
+						state.cooldown = parsed;
+						state.probeResults = state.probeResults.filter((row) => cooldownRowScope(row) !== scope);
+					});
+				} catch (error) {
+					if (generation !== this.cooldownGeneration) return;
+					const wire = error;
+					this.store.update((state) => {
+						state.cooldownBusy = null;
+						state.cooldownBusyScope = "";
+						state.cooldownStatus = "error";
+						state.cooldownError = typeof wire?.message === "string" ? wire.message : messageOf(error);
+					});
+				}
+			}
+			async probeRoutes(scope = "") {
+				const generation = ++this.cooldownGeneration;
+				this.store.update((state) => {
+					state.cooldownBusy = "probing";
+					state.cooldownBusyScope = scope;
+				});
+				try {
+					const result = await this.rpc.call("/api", "fallbacks/probe", { args: { scope } });
+					if (generation !== this.cooldownGeneration) return;
+					if (!result.ok) throw result.error;
+					const wire = result.value;
+					const parsed = parseCooldownWire(wire);
+					const fresh = Array.isArray(wire?.results) ? wire.results.filter((row) => row !== null && typeof row === "object") : [];
+					const previous = this.store.getSnapshot().probeResults;
+					const results = [...previous.filter((row) => cooldownRowScope(row) !== scope), ...fresh];
+					this.store.update((state) => {
+						state.cooldownBusy = null;
+						state.cooldownBusyScope = "";
+						state.cooldownStatus = "ready";
+						state.cooldownError = null;
+						state.cooldown = parsed;
+						state.probeResults = results;
+					});
+				} catch (error) {
+					if (generation !== this.cooldownGeneration) return;
+					const wire = error;
+					this.store.update((state) => {
+						state.cooldownBusy = null;
+						state.cooldownBusyScope = "";
+						state.cooldownStatus = "error";
+						state.cooldownError = typeof wire?.message === "string" ? wire.message : messageOf(error);
+					});
+				}
+			}
 			async save(next) {
 				const state = this.store.getSnapshot();
 				if (!state.writable || state.status === "saving") return;
@@ -1532,6 +1606,15 @@ window.__ModuleLoader__.load({
 			"cooldown.seconds": "{count} 秒",
 			"cooldown.minutes": "{count} 分钟",
 			"cooldown.hours": "{hours} 小时 {minutes} 分",
+			"cooldown.reset": "重置冷却",
+			"cooldown.resetTip": "清除全部已冷却的模型，整条链立刻重新参与优先级排序。",
+			"cooldown.probe": "检测连通",
+			"cooldown.probing": "检测中…",
+			"cooldown.probeTip": "逐条探活当前链路里的每个 provider/model：失败的立刻冷却，成功的立刻解封。",
+			"cooldown.probeSummary": "已检测 {count} 条：{ok} 条连通，{benched} 条已冷却，{inconclusive} 条未判定（未计入冷却）",
+			"cooldown.probeOk": "连通",
+			"cooldown.probeFailed": "失败",
+			"pools.drag": "拖动调整优先级",
 			"defaultModel.label": "默认模型",
 			"chains.selector.remove": "删除该选择器",
 			"chains.selector.providerPlaceholder": "选择 provider",
@@ -1756,6 +1839,15 @@ window.__ModuleLoader__.load({
 			"cooldown.seconds": "{count}s",
 			"cooldown.minutes": "{count}m",
 			"cooldown.hours": "{hours}h {minutes}m",
+			"cooldown.reset": "Reset cooldowns",
+			"cooldown.resetTip": "Clear every benched model so the whole chain re-enters priority selection immediately.",
+			"cooldown.probe": "Test connectivity",
+			"cooldown.probing": "Testing…",
+			"cooldown.probeTip": "Probe every provider/model in the current chains: failures are benched at once, working routes are released immediately.",
+			"cooldown.probeSummary": "Probed {count} routes: {ok} reachable, {benched} benched, {inconclusive} inconclusive (not benched)",
+			"cooldown.probeOk": "reachable",
+			"cooldown.probeFailed": "failed",
+			"pools.drag": "Drag to change priority",
 			"defaultModel.label": "Default model",
 			"chains.selector.remove": "Remove this selector",
 			"chains.selector.providerPlaceholder": "Select provider",
@@ -1957,7 +2049,7 @@ window.__ModuleLoader__.load({
 		}
 		//#endregion
 		//#region \0dsh-css:/home/runner/work/dsh-llm-fallbacks/dsh-llm-fallbacks/src/client/FallbacksCard.module.css.mjs
-		const css$3 = "\n\n\n._20fd0e45_root {\n  min-width: 0;\n}\n\n\n._4e39cf17_readOnly {\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n._9860a5b1_notice {\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-business-primary);\n}\n\n\n._5006d43e_legacyNotice {\n  margin: 12px 0 0;\n  padding: 10px 12px;\n  border-radius: 8px;\n  background: var(--dsw-alias-bg-module-platform);\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-business-primary);\n}\n\n._21918751_error {\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-error-primary);\n}\n\n\n._7cea4b2f_noticeRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin: 12px 0 0;\n}\n\n._7cea4b2f_noticeRow ._21918751_error {\n  flex: 1;\n  min-width: 0;\n  margin: 0;\n}\n\n\n._94c91bfd_fieldset {\n  margin: 0;\n  padding: 0;\n  border: none;\n  display: flex;\n  flex-direction: column;\n  min-width: 0;\n}\n\n\n._ba240d82_sectionHeading {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin: 0;\n  padding: 4px 0;\n  font-size: 16px;\n  line-height: 24px;\n  font-weight: 600;\n  color: var(--dsw-alias-label-primary);\n}\n\n._ddbc1b49_sectionHeadingText {\n  display: block;\n  min-width: 0;\n}\n\n\n._c41f9db7_sectionActions {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin-left: auto;\n}\n\n._c41f9db7_sectionActions ._f0864181_discard,\n._c41f9db7_sectionActions ._ccff7e48_save {\n  padding: 3px 12px;\n  font-size: 12px;\n  line-height: 18px;\n}\n\n\n._b116c758_sectionToggle {\n  appearance: none;\n  border: 0;\n  background: none;\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  margin: 0;\n  padding: 0;\n  font: inherit;\n  color: inherit;\n  cursor: pointer;\n}\n\n._b116c758_sectionToggle:disabled {\n  cursor: default;\n}\n\n._b116c758_sectionToggle:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n\n._80101203_advancedBody {\n  display: flex;\n  flex-direction: column;\n  min-width: 0;\n}\n\n._94c91bfd_fieldset > ._80101203_advancedBody > ._67826267_field,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._9998065c_checkboxRow,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._3e95886d_numberFields {\n  padding: 12px 0;\n}\n\n._94c91bfd_fieldset > ._80101203_advancedBody > ._67826267_field + ._67826267_field,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._9998065c_checkboxRow + ._67826267_field,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._67826267_field + ._3e95886d_numberFields {\n  border-top: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n\n._67826267_field {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  margin: 0;\n  padding: 0;\n  border: none;\n  min-width: 0;\n}\n\n\n._94c91bfd_fieldset > ._67826267_field,\n._94c91bfd_fieldset > ._9998065c_checkboxRow,\n._94c91bfd_fieldset > ._3e95886d_numberFields {\n  padding: 12px 0;\n}\n\n._94c91bfd_fieldset > ._67826267_field + ._67826267_field,\n._94c91bfd_fieldset > ._67826267_field + ._3e95886d_numberFields,\n._94c91bfd_fieldset > ._9998065c_checkboxRow + ._67826267_field {\n  border-top: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n\n._9998065c_checkboxRow {\n  display: flex;\n  align-items: flex-start;\n  gap: 8px;\n}\n\n\n._9998065c_checkboxRow ._06389b18_checkbox {\n  margin-top: 3px;\n}\n\n._13e68c3f_fieldLabel {\n  \n  display: inline-flex;\n  align-items: center;\n  gap: 10px;\n  padding: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  font-weight: 500;\n  color: var(--dsw-alias-label-primary);\n}\n\n._4bc809b8_hint {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n\n._02c2f6df_checkLabel {\n  flex: 1;\n  min-width: 0;\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  font-size: 14px;\n  line-height: 22px;\n  font-weight: 400;\n  color: var(--dsw-alias-label-primary);\n  cursor: pointer;\n}\n\n._f2d47237_checkLabelTitle {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  font-weight: 400;\n}\n\n._c1bed8ea_checkLabelDesc {\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 400;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n\n._06389b18_checkbox {\n  flex: none;\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-brand-primary);\n  cursor: pointer;\n}\n\n._06389b18_checkbox:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n\n._b1962759_slotPresetName {\n  font-size: 14px;\n  line-height: 22px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-primary);\n}\n\n\n._a6244318_infoHint {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  flex: none;\n  width: 16px;\n  height: 16px;\n  border-radius: 50%;\n  font-size: 14px;\n  line-height: 1;\n  color: var(--dsw-alias-label-tertiary);\n  background: var(--dsw-alias-interactive-bg-hover);\n  cursor: help;\n  user-select: none;\n}\n\n._a6244318_infoHint:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n._a6244318_infoHint::after {\n  content: attr(data-tip);\n  position: absolute;\n  top: 50%;\n  left: calc(100% + 8px);\n  transform: translateY(-50%);\n  z-index: 10;\n  box-sizing: border-box;\n  width: max-content;\n  max-width: 280px;\n  padding: 5px 10px;\n  border-radius: 8px;\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n  font-size: 11px;\n  line-height: 17px;\n  font-weight: 400;\n  white-space: normal;\n  text-align: left;\n  pointer-events: none;\n  opacity: 0;\n  transition: opacity .12s;\n}\n\n._a6244318_infoHint:hover::after,\n._a6244318_infoHint:focus-visible::after {\n  opacity: 1;\n}\n\n\n._e655c840_infoHintDisabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n\n._a2521bb0_optionRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  padding: 6px 8px;\n  border-radius: 6px;\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-primary);\n  cursor: pointer;\n}\n\n._a2521bb0_optionRow:hover:has(input:not(:disabled)) {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n\n._06389b18_checkbox,\n._a2521bb0_optionRow input {\n  flex: none;\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-brand-primary);\n  cursor: pointer;\n}\n\n._06389b18_checkbox:focus-visible,\n._a2521bb0_optionRow input:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n._a2521bb0_optionRow input:disabled {\n  cursor: default;\n}\n\n\n._c4ecbdf3_dayRow {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 4px;\n}\n\n._0330c1ed_dayCell {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  padding: 2px 6px;\n  border-radius: 6px;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n}\n\n._0330c1ed_dayCell:hover:has(input:not(:disabled)) {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n._0330c1ed_dayCell input {\n  flex: none;\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-brand-primary);\n  cursor: pointer;\n}\n\n._0330c1ed_dayCell input:disabled {\n  cursor: default;\n}\n\n._0330c1ed_dayCell input:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n\n._f9d86f7b_input {\n  box-sizing: border-box;\n  width: 100%;\n  height: 34px;\n  padding: 0 12px;\n  border: 0.5px solid var(--dsw-alias-border-l4);\n  border-radius: var(--dsw-radius-md);\n  font: inherit;\n  font-size: 13px;\n  line-height: 1.5;\n  background: var(--dsw-alias-bg-layer-3);\n  color: var(--dsw-alias-label-primary);\n}\n\n._f9d86f7b_input:focus-visible {\n  outline: none;\n  border-color: var(--dsw-alias-state-business-primary);\n}\n\n._f9d86f7b_input::placeholder {\n  color: var(--dsw-alias-label-dimmed);\n}\n\n._f9d86f7b_input:disabled {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: default;\n}\n\n\n._3a9b42fd_inputTextarea {\n  height: auto;\n  min-height: 72px;\n  padding: 8px 12px;\n  resize: vertical;\n}\n\n\n._1285c19b_personaBriefRow {\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n}\n\n._4b8f7345_personaBrief {\n  flex: 1;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-primary);\n}\n\n\n._2686400e_personaBriefEmpty {\n  color: var(--dsw-alias-label-tertiary);\n}\n\n\n._4e4a07be_personaFull {\n  margin: 0;\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-secondary);\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n\n\n._7b60337a_inputInvalid,\n._7b60337a_inputInvalid:focus-visible {\n  border-color: var(--dsw-alias-state-error-primary);\n}\n\n\nselect._f9d86f7b_input {\n  max-width: 240px;\n  cursor: pointer;\n}\n\n\n._16eb7153_selectInput {\n  appearance: none;\n  padding-right: 32px;\n  \n  background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%2381858C' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\");\n  background-repeat: no-repeat;\n  background-position: right 12px center;\n  background-size: 12px 12px;\n}\n\n\n._3e95886d_numberFields {\n  display: grid;\n  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));\n  gap: 12px;\n}\n\n._3e95886d_numberFields ._67826267_field {\n  padding: 0;\n}\n\n._0cfb5881_list {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  margin-top: 4px;\n}\n\n\n._f5c620d6_editorCard {\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n  padding: 14px 16px;\n  border-radius: 12px;\n  background: var(--dsw-alias-bg-module-platform);\n}\n\n._224b1387_cardFoot {\n  display: flex;\n  justify-content: flex-end;\n}\n\n._8e220e07_ruleGrid {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 8px;\n}\n\n._24a12a2f_ruleCell {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  min-width: 120px;\n  flex: 1;\n}\n\n._1014c097_ruleCellLabel {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._631094a0_chevron {\n  flex: none;\n  color: var(--dsw-alias-label-tertiary);\n  transform: rotate(-90deg);\n  transition: transform .16s;\n}\n\n._44836ce8_chevronOpen {\n  transform: none;\n}\n\n\n._cf3961bb_chevronFlip {\n  transform: rotate(180deg);\n}\n\n\n._86bc52d2_collapseRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n\n._a73efcc6_collapseToggle {\n  appearance: none;\n  border: 0;\n  background: none;\n  padding: 0;\n  cursor: pointer;\n  color: var(--dsw-alias-label-secondary);\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex: 1;\n  min-width: 0;\n  font: inherit;\n  text-align: left;\n}\n\n._a73efcc6_collapseToggle:disabled {\n  cursor: default;\n}\n\n._af017718_collapseTitle {\n  \n  flex: none;\n  max-width: 55%;\n  min-width: 0;\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-primary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n._2cabe603_collapseMeta {\n  \n  flex: none;\n  margin-left: auto;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n\n._52d6df87_seedBadge {\n  flex: none;\n  max-width: 40%;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  line-height: 17px;\n  font-weight: 500;\n  white-space: nowrap;\n  background: var(--dsw-alias-bg-layer-1);\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._7b04f727_slotTag {\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  border-radius: 999px;\n  padding: 0 6px;\n  font-size: 11px;\n  line-height: 17px;\n  font-weight: 500;\n  white-space: nowrap;\n  border: 1px solid;\n}\n\n._c381e792_slotTagHighCost {\n  color: var(--dsw-alias-state-error-primary);\n  border-color: var(--dsw-alias-state-error-primary);\n  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);\n}\n\n._23bdb6fc_slotTagMultiplier {\n  color: var(--dsw-alias-state-warn-primary);\n  border-color: var(--dsw-alias-state-warn-primary);\n  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 10%, transparent);\n}\n\n._f000eed9_slotTagActive {\n  color: var(--dsw-alias-state-success-primary);\n  border-color: var(--dsw-alias-state-success-primary);\n  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, transparent);\n}\n\n\n._cd905ce5_dragHandle {\n  appearance: none;\n  border: 0;\n  background: none;\n  padding: 0;\n  cursor: grab;\n  color: var(--dsw-alias-label-tertiary);\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 20px;\n  height: 20px;\n  border-radius: 6px;\n  flex: none;\n}\n\n._cd905ce5_dragHandle:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n._cd905ce5_dragHandle:active {\n  cursor: grabbing;\n}\n\n._cd905ce5_dragHandle:disabled {\n  cursor: default;\n  opacity: 0.4;\n}\n\n._cd905ce5_dragHandle:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n\n._fee63b7e_slotCardDragging {\n  opacity: 0.45;\n}\n\n._6f108491_slotCardOver {\n  outline: 1px dashed var(--dsw-alias-brand-primary);\n  outline-offset: 2px;\n}\n\n\n._15a12620_chainSelectors {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n\n._240cbbf8_selectorRow {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n\n\n._70effa64_iconButton {\n  position: relative;\n  box-sizing: border-box;\n  appearance: none;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 28px;\n  height: 28px;\n  padding: 0;\n  border: 0;\n  border-radius: 6px;\n  background: none;\n  color: var(--dsw-alias-label-tertiary);\n  cursor: pointer;\n}\n\n._70effa64_iconButton:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n._70effa64_iconButton:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n._70effa64_iconButton:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n._70effa64_iconButton::after {\n  content: attr(data-tip);\n  position: absolute;\n  bottom: calc(100% + 6px);\n  left: 50%;\n  transform: translateX(-50%);\n  padding: 3px 8px;\n  border-radius: 6px;\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n  font-size: 11px;\n  line-height: 17px;\n  white-space: nowrap;\n  opacity: 0;\n  pointer-events: none;\n  transition: opacity .12s;\n}\n\n._70effa64_iconButton:hover::after,\n._70effa64_iconButton:focus-visible::after {\n  opacity: 1;\n}\n\n\n._a0968257_iconButtonDanger:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover-danger);\n  color: var(--dsw-alias-state-error-primary);\n}\n\n\n._711248a9_outlineButton {\n  appearance: none;\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  padding: 4px 10px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: var(--dsw-radius-md);\n  background: none;\n  font: inherit;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n}\n\n._711248a9_outlineButton:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n._711248a9_outlineButton:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n._711248a9_outlineButton:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n\n._28202c90_addButton {\n  align-self: flex-start;\n}\n\n\n._6a2bd54c_slotAddRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin-top: 4px;\n  flex-wrap: wrap;\n}\n\n\n._4e77523e_rowActions {\n  display: flex;\n  align-items: center;\n  gap: 4px;\n}\n\n\n._f0864181_discard,\n._ccff7e48_save {\n  appearance: none;\n  border: 1px solid transparent;\n  border-radius: var(--dsw-radius-md);\n  padding: 5px 14px;\n  font: inherit;\n  font-size: 13px;\n  line-height: 1.5;\n  cursor: pointer;\n}\n\n._f0864181_discard {\n  border-color: var(--dsw-alias-border-l2);\n  background: none;\n  color: var(--dsw-alias-label-secondary);\n}\n\n._f0864181_discard:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n._ccff7e48_save {\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n}\n\n._f0864181_discard:disabled,\n._ccff7e48_save:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n._f0864181_discard:focus-visible,\n._ccff7e48_save:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n\n._fbd045e0_statusBlock {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n  padding: 12px 14px;\n  margin-top: 12px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 12px;\n}\n\n._d4f70367_statusTitle {\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._8ab300ed_statusLine {\n  margin: 0;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  white-space: nowrap;\n  overflow: hidden;\n  text-overflow: ellipsis;\n}\n\n._e8cedbf5_statusLineLabel {\n  font-weight: 500;\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._700006c9_policyStatus {\n  margin: 12px 0 0;\n  padding: 10px 12px;\n  border-radius: 8px;\n  background: var(--dsw-alias-bg-module-platform);\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n\n._d4b67a81_policyStatusLabel {\n  font-size: 12px;\n  font-weight: 600;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n._278bb4b3_policyStatusLine {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-primary);\n}\n\n._da6387e5_policyStatusWarn {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatus {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-1);\n}\n\n._c0d1a2b3_poolStatusHead {\n  display: flex;\n  align-items: baseline;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n\n._c0d1a2b3_poolStatusTitle {\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-secondary);\n}\n\n._c0d1a2b3_poolStatusMeta {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-success-primary);\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n._c0d1a2b3_poolStatusList {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  margin: 0;\n  padding: 0;\n  list-style: none;\n}\n\n._c0d1a2b3_poolStatusChip {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n  font-size: 12px;\n  line-height: 18px;\n}\n\n._c0d1a2b3_poolStatusDot {\n  flex: none;\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-dimmed);\n}\n\n._c0d1a2b3_poolStatusName {\n  flex: 1 1 auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--dsw-alias-label-primary);\n}\n\n._c0d1a2b3_poolStatusState {\n  flex: none;\n  white-space: nowrap;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n._c0d1a2b3_poolStatusNote {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatusChipLive ._c0d1a2b3_poolStatusDot {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n._c0d1a2b3_poolStatusChipCooling ._c0d1a2b3_poolStatusDot {\n  background: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatusChipPermanent ._c0d1a2b3_poolStatusDot {\n  background: var(--dsw-alias-state-error-primary);\n}\n\n._c0d1a2b3_poolStatusChipLive ._c0d1a2b3_poolStatusState {\n  color: var(--dsw-alias-state-success-primary);\n}\n\n._c0d1a2b3_poolStatusChipCooling ._c0d1a2b3_poolStatusState {\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatusChipPermanent ._c0d1a2b3_poolStatusState {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n@media (prefers-reduced-motion: reduce) {\n  ._70effa64_iconButton::after,\n  ._a6244318_infoHint::after {\n    transition: none;\n  }\n\n  ._631094a0_chevron {\n    transition: none;\n  }\n}\n";
+		const css$3 = "\n\n\n._20fd0e45_root {\n  min-width: 0;\n}\n\n\n._4e39cf17_readOnly {\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 1.5;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n._9860a5b1_notice {\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-business-primary);\n}\n\n\n._5006d43e_legacyNotice {\n  margin: 12px 0 0;\n  padding: 10px 12px;\n  border-radius: 8px;\n  background: var(--dsw-alias-bg-module-platform);\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-business-primary);\n}\n\n._21918751_error {\n  margin: 12px 0 0;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-error-primary);\n}\n\n\n._7cea4b2f_noticeRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin: 12px 0 0;\n}\n\n._7cea4b2f_noticeRow ._21918751_error {\n  flex: 1;\n  min-width: 0;\n  margin: 0;\n}\n\n\n._94c91bfd_fieldset {\n  margin: 0;\n  padding: 0;\n  border: none;\n  display: flex;\n  flex-direction: column;\n  min-width: 0;\n}\n\n\n._ba240d82_sectionHeading {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin: 0;\n  padding: 4px 0;\n  font-size: 16px;\n  line-height: 24px;\n  font-weight: 600;\n  color: var(--dsw-alias-label-primary);\n}\n\n._ddbc1b49_sectionHeadingText {\n  display: block;\n  min-width: 0;\n}\n\n\n._c41f9db7_sectionActions {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin-left: auto;\n}\n\n._c41f9db7_sectionActions ._f0864181_discard,\n._c41f9db7_sectionActions ._ccff7e48_save {\n  padding: 3px 12px;\n  font-size: 12px;\n  line-height: 18px;\n}\n\n\n._b116c758_sectionToggle {\n  appearance: none;\n  border: 0;\n  background: none;\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  margin: 0;\n  padding: 0;\n  font: inherit;\n  color: inherit;\n  cursor: pointer;\n}\n\n._b116c758_sectionToggle:disabled {\n  cursor: default;\n}\n\n._b116c758_sectionToggle:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n\n._80101203_advancedBody {\n  display: flex;\n  flex-direction: column;\n  min-width: 0;\n}\n\n._94c91bfd_fieldset > ._80101203_advancedBody > ._67826267_field,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._9998065c_checkboxRow,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._3e95886d_numberFields {\n  padding: 12px 0;\n}\n\n._94c91bfd_fieldset > ._80101203_advancedBody > ._67826267_field + ._67826267_field,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._9998065c_checkboxRow + ._67826267_field,\n._94c91bfd_fieldset > ._80101203_advancedBody > ._67826267_field + ._3e95886d_numberFields {\n  border-top: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n\n._67826267_field {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  margin: 0;\n  padding: 0;\n  border: none;\n  min-width: 0;\n}\n\n\n._94c91bfd_fieldset > ._67826267_field,\n._94c91bfd_fieldset > ._9998065c_checkboxRow,\n._94c91bfd_fieldset > ._3e95886d_numberFields {\n  padding: 12px 0;\n}\n\n._94c91bfd_fieldset > ._67826267_field + ._67826267_field,\n._94c91bfd_fieldset > ._67826267_field + ._3e95886d_numberFields,\n._94c91bfd_fieldset > ._9998065c_checkboxRow + ._67826267_field {\n  border-top: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n\n._9998065c_checkboxRow {\n  display: flex;\n  align-items: flex-start;\n  gap: 8px;\n}\n\n\n._9998065c_checkboxRow ._06389b18_checkbox {\n  margin-top: 3px;\n}\n\n._13e68c3f_fieldLabel {\n  \n  display: inline-flex;\n  align-items: center;\n  gap: 10px;\n  padding: 0;\n  font-size: 13px;\n  line-height: 1.5;\n  font-weight: 500;\n  color: var(--dsw-alias-label-primary);\n}\n\n._4bc809b8_hint {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n\n._02c2f6df_checkLabel {\n  flex: 1;\n  min-width: 0;\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  font-size: 14px;\n  line-height: 22px;\n  font-weight: 400;\n  color: var(--dsw-alias-label-primary);\n  cursor: pointer;\n}\n\n._f2d47237_checkLabelTitle {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  font-weight: 400;\n}\n\n._c1bed8ea_checkLabelDesc {\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 400;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n\n._06389b18_checkbox {\n  flex: none;\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-brand-primary);\n  cursor: pointer;\n}\n\n._06389b18_checkbox:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n\n._b1962759_slotPresetName {\n  font-size: 14px;\n  line-height: 22px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-primary);\n}\n\n\n._a6244318_infoHint {\n  position: relative;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  flex: none;\n  width: 16px;\n  height: 16px;\n  border-radius: 50%;\n  font-size: 14px;\n  line-height: 1;\n  color: var(--dsw-alias-label-tertiary);\n  background: var(--dsw-alias-interactive-bg-hover);\n  cursor: help;\n  user-select: none;\n}\n\n._a6244318_infoHint:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n._a6244318_infoHint::after {\n  content: attr(data-tip);\n  position: absolute;\n  top: 50%;\n  left: calc(100% + 8px);\n  transform: translateY(-50%);\n  z-index: 10;\n  box-sizing: border-box;\n  width: max-content;\n  max-width: 280px;\n  padding: 5px 10px;\n  border-radius: 8px;\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n  font-size: 11px;\n  line-height: 17px;\n  font-weight: 400;\n  white-space: normal;\n  text-align: left;\n  pointer-events: none;\n  opacity: 0;\n  transition: opacity .12s;\n}\n\n._a6244318_infoHint:hover::after,\n._a6244318_infoHint:focus-visible::after {\n  opacity: 1;\n}\n\n\n._e655c840_infoHintDisabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n\n._a2521bb0_optionRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  padding: 6px 8px;\n  border-radius: 6px;\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-primary);\n  cursor: pointer;\n}\n\n._a2521bb0_optionRow:hover:has(input:not(:disabled)) {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n\n._06389b18_checkbox,\n._a2521bb0_optionRow input {\n  flex: none;\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-brand-primary);\n  cursor: pointer;\n}\n\n._06389b18_checkbox:focus-visible,\n._a2521bb0_optionRow input:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n._a2521bb0_optionRow input:disabled {\n  cursor: default;\n}\n\n\n._c4ecbdf3_dayRow {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 4px;\n}\n\n._0330c1ed_dayCell {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  padding: 2px 6px;\n  border-radius: 6px;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n}\n\n._0330c1ed_dayCell:hover:has(input:not(:disabled)) {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n._0330c1ed_dayCell input {\n  flex: none;\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-brand-primary);\n  cursor: pointer;\n}\n\n._0330c1ed_dayCell input:disabled {\n  cursor: default;\n}\n\n._0330c1ed_dayCell input:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n\n._f9d86f7b_input {\n  box-sizing: border-box;\n  width: 100%;\n  height: 34px;\n  padding: 0 12px;\n  border: 0.5px solid var(--dsw-alias-border-l4);\n  border-radius: var(--dsw-radius-md);\n  font: inherit;\n  font-size: 13px;\n  line-height: 1.5;\n  background: var(--dsw-alias-bg-layer-3);\n  color: var(--dsw-alias-label-primary);\n}\n\n._f9d86f7b_input:focus-visible {\n  outline: none;\n  border-color: var(--dsw-alias-state-business-primary);\n}\n\n._f9d86f7b_input::placeholder {\n  color: var(--dsw-alias-label-dimmed);\n}\n\n._f9d86f7b_input:disabled {\n  color: var(--dsw-alias-label-tertiary);\n  cursor: default;\n}\n\n\n._3a9b42fd_inputTextarea {\n  height: auto;\n  min-height: 72px;\n  padding: 8px 12px;\n  resize: vertical;\n}\n\n\n._1285c19b_personaBriefRow {\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  min-width: 0;\n}\n\n._4b8f7345_personaBrief {\n  flex: 1;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-primary);\n}\n\n\n._2686400e_personaBriefEmpty {\n  color: var(--dsw-alias-label-tertiary);\n}\n\n\n._4e4a07be_personaFull {\n  margin: 0;\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-secondary);\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n\n\n._7b60337a_inputInvalid,\n._7b60337a_inputInvalid:focus-visible {\n  border-color: var(--dsw-alias-state-error-primary);\n}\n\n\nselect._f9d86f7b_input {\n  max-width: 240px;\n  cursor: pointer;\n}\n\n\n._16eb7153_selectInput {\n  appearance: none;\n  padding-right: 32px;\n  \n  background-image: url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%2381858C' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E\");\n  background-repeat: no-repeat;\n  background-position: right 12px center;\n  background-size: 12px 12px;\n}\n\n\n._3e95886d_numberFields {\n  display: grid;\n  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));\n  gap: 12px;\n}\n\n._3e95886d_numberFields ._67826267_field {\n  padding: 0;\n}\n\n._0cfb5881_list {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  margin-top: 4px;\n}\n\n\n._f5c620d6_editorCard {\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n  padding: 14px 16px;\n  border-radius: 12px;\n  background: var(--dsw-alias-bg-module-platform);\n}\n\n._224b1387_cardFoot {\n  display: flex;\n  justify-content: flex-end;\n}\n\n._8e220e07_ruleGrid {\n  display: flex;\n  flex-wrap: wrap;\n  gap: 8px;\n}\n\n._24a12a2f_ruleCell {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  min-width: 120px;\n  flex: 1;\n}\n\n._1014c097_ruleCellLabel {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._631094a0_chevron {\n  flex: none;\n  color: var(--dsw-alias-label-tertiary);\n  transform: rotate(-90deg);\n  transition: transform .16s;\n}\n\n._44836ce8_chevronOpen {\n  transform: none;\n}\n\n\n._cf3961bb_chevronFlip {\n  transform: rotate(180deg);\n}\n\n\n._86bc52d2_collapseRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n\n._a73efcc6_collapseToggle {\n  appearance: none;\n  border: 0;\n  background: none;\n  padding: 0;\n  cursor: pointer;\n  color: var(--dsw-alias-label-secondary);\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex: 1;\n  min-width: 0;\n  font: inherit;\n  text-align: left;\n}\n\n._a73efcc6_collapseToggle:disabled {\n  cursor: default;\n}\n\n._af017718_collapseTitle {\n  \n  flex: none;\n  max-width: 55%;\n  min-width: 0;\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-primary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n._2cabe603_collapseMeta {\n  \n  flex: none;\n  margin-left: auto;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n\n._52d6df87_seedBadge {\n  flex: none;\n  max-width: 40%;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  border-radius: 999px;\n  padding: 1px 8px;\n  font-size: 11px;\n  line-height: 17px;\n  font-weight: 500;\n  white-space: nowrap;\n  background: var(--dsw-alias-bg-layer-1);\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._7b04f727_slotTag {\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  border-radius: 999px;\n  padding: 0 6px;\n  font-size: 11px;\n  line-height: 17px;\n  font-weight: 500;\n  white-space: nowrap;\n  border: 1px solid;\n}\n\n._c381e792_slotTagHighCost {\n  color: var(--dsw-alias-state-error-primary);\n  border-color: var(--dsw-alias-state-error-primary);\n  background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 10%, transparent);\n}\n\n._23bdb6fc_slotTagMultiplier {\n  color: var(--dsw-alias-state-warn-primary);\n  border-color: var(--dsw-alias-state-warn-primary);\n  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 10%, transparent);\n}\n\n._f000eed9_slotTagActive {\n  color: var(--dsw-alias-state-success-primary);\n  border-color: var(--dsw-alias-state-success-primary);\n  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, transparent);\n}\n\n\n._cd905ce5_dragHandle {\n  appearance: none;\n  border: 0;\n  background: none;\n  padding: 0;\n  cursor: grab;\n  color: var(--dsw-alias-label-tertiary);\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 20px;\n  height: 20px;\n  border-radius: 6px;\n  flex: none;\n}\n\n._cd905ce5_dragHandle:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n._cd905ce5_dragHandle:active {\n  cursor: grabbing;\n}\n\n._cd905ce5_dragHandle:disabled {\n  cursor: default;\n  opacity: 0.4;\n}\n\n._cd905ce5_dragHandle:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n\n._fee63b7e_slotCardDragging {\n  opacity: 0.45;\n}\n\n._6f108491_slotCardOver {\n  outline: 1px dashed var(--dsw-alias-brand-primary);\n  outline-offset: 2px;\n}\n\n\n._15a12620_chainSelectors {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n\n._240cbbf8_selectorRow {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n\n\n._70effa64_iconButton {\n  position: relative;\n  box-sizing: border-box;\n  appearance: none;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 28px;\n  height: 28px;\n  padding: 0;\n  border: 0;\n  border-radius: 6px;\n  background: none;\n  color: var(--dsw-alias-label-tertiary);\n  cursor: pointer;\n}\n\n._70effa64_iconButton:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n._70effa64_iconButton:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n._70effa64_iconButton:focus-visible {\n  outline: none;\n  box-shadow: 0 0 0 2px var(--dsw-alias-border-l3);\n}\n\n._70effa64_iconButton::after {\n  content: attr(data-tip);\n  position: absolute;\n  bottom: calc(100% + 6px);\n  left: 50%;\n  transform: translateX(-50%);\n  padding: 3px 8px;\n  border-radius: 6px;\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n  font-size: 11px;\n  line-height: 17px;\n  white-space: nowrap;\n  opacity: 0;\n  pointer-events: none;\n  transition: opacity .12s;\n}\n\n._70effa64_iconButton:hover::after,\n._70effa64_iconButton:focus-visible::after {\n  opacity: 1;\n}\n\n\n._a0968257_iconButtonDanger:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover-danger);\n  color: var(--dsw-alias-state-error-primary);\n}\n\n\n._711248a9_outlineButton {\n  appearance: none;\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  padding: 4px 10px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: var(--dsw-radius-md);\n  background: none;\n  font: inherit;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n}\n\n._711248a9_outlineButton:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n._711248a9_outlineButton:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n._711248a9_outlineButton:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n\n._28202c90_addButton {\n  align-self: flex-start;\n}\n\n\n._6a2bd54c_slotAddRow {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  margin-top: 4px;\n  flex-wrap: wrap;\n}\n\n\n._4e77523e_rowActions {\n  display: flex;\n  align-items: center;\n  gap: 4px;\n}\n\n\n._f0864181_discard,\n._ccff7e48_save {\n  appearance: none;\n  border: 1px solid transparent;\n  border-radius: var(--dsw-radius-md);\n  padding: 5px 14px;\n  font: inherit;\n  font-size: 13px;\n  line-height: 1.5;\n  cursor: pointer;\n}\n\n._f0864181_discard {\n  border-color: var(--dsw-alias-border-l2);\n  background: none;\n  color: var(--dsw-alias-label-secondary);\n}\n\n._f0864181_discard:hover:not(:disabled) {\n  color: var(--dsw-alias-label-primary);\n  border-color: var(--dsw-alias-label-dimmed);\n}\n\n._ccff7e48_save {\n  background: var(--dsw-alias-label-primary);\n  color: var(--dsw-alias-bg-layer-3);\n}\n\n._f0864181_discard:disabled,\n._ccff7e48_save:disabled {\n  opacity: 0.4;\n  cursor: default;\n}\n\n._f0864181_discard:focus-visible,\n._ccff7e48_save:focus-visible {\n  outline: 2px solid var(--dsw-alias-brand-primary);\n  outline-offset: 1px;\n}\n\n\n._fbd045e0_statusBlock {\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n  padding: 12px 14px;\n  margin-top: 12px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 12px;\n}\n\n._d4f70367_statusTitle {\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._8ab300ed_statusLine {\n  margin: 0;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  white-space: nowrap;\n  overflow: hidden;\n  text-overflow: ellipsis;\n}\n\n._e8cedbf5_statusLineLabel {\n  font-weight: 500;\n  color: var(--dsw-alias-label-secondary);\n}\n\n\n._700006c9_policyStatus {\n  margin: 12px 0 0;\n  padding: 10px 12px;\n  border-radius: 8px;\n  background: var(--dsw-alias-bg-module-platform);\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n\n._d4b67a81_policyStatusLabel {\n  font-size: 12px;\n  font-weight: 600;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n._278bb4b3_policyStatusLine {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-primary);\n}\n\n._da6387e5_policyStatusWarn {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatus {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-1);\n}\n\n._c0d1a2b3_poolStatusHead {\n  display: flex;\n  align-items: baseline;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n\n._c0d1a2b3_poolStatusTitle {\n  font-size: 12px;\n  line-height: 18px;\n  font-weight: 500;\n  color: var(--dsw-alias-label-secondary);\n}\n\n._c0d1a2b3_poolStatusMeta {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-success-primary);\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n._c0d1a2b3_poolStatusList {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  margin: 0;\n  padding: 0;\n  list-style: none;\n}\n\n._c0d1a2b3_poolStatusChip {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n  font-size: 12px;\n  line-height: 18px;\n}\n\n._c0d1a2b3_poolStatusDot {\n  flex: none;\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-dimmed);\n}\n\n._c0d1a2b3_poolStatusName {\n  flex: 1 1 auto;\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--dsw-alias-label-primary);\n}\n\n._c0d1a2b3_poolStatusState {\n  flex: none;\n  white-space: nowrap;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n._c0d1a2b3_poolStatusNote {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatusActions {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  margin-left: auto;\n}\n\n._c0d1a2b3_poolStatusChipLive ._c0d1a2b3_poolStatusDot {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n._c0d1a2b3_poolStatusChipCooling ._c0d1a2b3_poolStatusDot {\n  background: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatusChipPermanent ._c0d1a2b3_poolStatusDot {\n  background: var(--dsw-alias-state-error-primary);\n}\n\n._c0d1a2b3_poolStatusChipLive ._c0d1a2b3_poolStatusState {\n  color: var(--dsw-alias-state-success-primary);\n}\n\n._c0d1a2b3_poolStatusChipCooling ._c0d1a2b3_poolStatusState {\n  color: var(--dsw-alias-state-warn-primary);\n}\n\n._c0d1a2b3_poolStatusChipPermanent ._c0d1a2b3_poolStatusState {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n@media (prefers-reduced-motion: reduce) {\n  ._70effa64_iconButton::after,\n  ._a6244318_infoHint::after {\n    transition: none;\n  }\n\n  ._631094a0_chevron {\n    transition: none;\n  }\n}\n";
 		const tagId$3 = "dsh-llm-fallbacks/FallbacksCard.module.css";
 		if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(tagId$3) + "]") === null) {
 			const tag = document.createElement("style");
@@ -2051,6 +2143,7 @@ window.__ModuleLoader__.load({
 			"poolStatusName": "_c0d1a2b3_poolStatusName",
 			"poolStatusState": "_c0d1a2b3_poolStatusState",
 			"poolStatusNote": "_c0d1a2b3_poolStatusNote",
+			"poolStatusActions": "_c0d1a2b3_poolStatusActions",
 			"poolStatusChipLive": "_c0d1a2b3_poolStatusChipLive",
 			"poolStatusChipCooling": "_c0d1a2b3_poolStatusChipCooling",
 			"poolStatusChipPermanent": "_c0d1a2b3_poolStatusChipPermanent"
@@ -2572,7 +2665,7 @@ window.__ModuleLoader__.load({
 		* existing value is never hidden or dropped. New rows only offer configured
 		* options.
 		*/
-		function ChainSelectorEditor({ selector, catalog, configuredProviders, disabled, t, onChange, onRemove }) {
+		function ChainSelectorEditor({ selector, catalog, configuredProviders, disabled, t, onChange, onRemove, drag }) {
 			const providerRaw = selectionToRaw(selector.provider);
 			const providerOutside = selector.provider?.kind === "outside";
 			const providerUnconfigured = !providerOutside && providerRaw !== "" && (catalog?.providers.some((entry) => entry.provider === providerRaw) ?? false) && !configuredProviders.some((entry) => entry.provider === providerRaw);
@@ -2582,7 +2675,18 @@ window.__ModuleLoader__.load({
 			const groupMissing = providerRaw !== "" && !providerOutside && group === void 0;
 			const modelDisabled = disabled || providerRaw === "" || groupMissing || providerOutside && modelRaw === "";
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-				className: FallbacksCard_module_css_default.selectorRow,
+				className: [FallbacksCard_module_css_default.selectorRow, drag !== void 0 && drag.dragging === true ? FallbacksCard_module_css_default.slotCardDragging : null, drag !== void 0 && drag.over === true ? FallbacksCard_module_css_default.slotCardOver : null].filter(Boolean).join(" "),
+				onDragOver: drag === void 0 ? void 0 : (event) => {
+					event.preventDefault();
+					drag.onOver();
+				},
+				onDragLeave: drag === void 0 ? void 0 : () => {
+					drag.onLeave();
+				},
+				onDrop: drag === void 0 ? void 0 : (event) => {
+					event.preventDefault();
+					drag.onDrop();
+				},
 				children: [
 					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: FallbacksCard_module_css_default.ruleGrid,
@@ -2671,16 +2775,30 @@ window.__ModuleLoader__.load({
 						className: FallbacksCard_module_css_default.hint,
 						children: t("chains.selector.wildcardLegacy")
 					}),
-					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 						className: FallbacksCard_module_css_default.cardFoot,
-						children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+						children: [drag !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: FallbacksCard_module_css_default.dragHandle,
+							draggable: drag.disabled !== true,
+							title: drag.label,
+							"aria-label": drag.label,
+							disabled: drag.disabled === true,
+							onDragStart: () => {
+								drag.onStart();
+							},
+							onDragEnd: () => {
+								drag.onEnd();
+							},
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(GripIcon, {})
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
 							type: "button",
 							className: `${FallbacksCard_module_css_default.iconButton} ${FallbacksCard_module_css_default.iconButtonDanger}`,
 							"data-tip": t("chains.selector.remove"),
 							"aria-label": t("chains.selector.remove"),
 							onClick: onRemove,
 							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(TrashIcon, {})
-						})
+						})]
 					})
 				]
 			});
@@ -2698,7 +2816,7 @@ window.__ModuleLoader__.load({
 		* at a glance. Purely derived from the `fallbacks/status` projection — it
 		* never writes configuration.
 		*/
-		function PoolChainStatus({ chain, t, configuredProviders }) {
+		function PoolChainStatus({ chain, t, configuredProviders, writable, busy, probeSummary, onReset, onProbe }) {
 			if (chain === void 0 || chain.chain.length === 0) return null;
 			const now = Date.now();
 			const displayNameOf = (provider) => configuredProviders.find((entry) => entry.provider === provider)?.displayName ?? provider;
@@ -2749,10 +2867,37 @@ window.__ModuleLoader__.load({
 					}), chain.head !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 						className: FallbacksCard_module_css_default.poolStatusMeta,
 						children: `${t("cooldown.live")}: ${displayNameOf(chain.head.provider)} · ${chain.head.model}`
-					})]
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+					className: FallbacksCard_module_css_default.poolStatusActions,
+					children: [
+						(onProbe !== void 0 || onReset !== void 0) && (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: FallbacksCard_module_css_default.outlineButton,
+							title: t("cooldown.probeTip"),
+							disabled: !writable || busy !== null,
+							onClick: () => {
+								if (busy === null) onProbe();
+							},
+							children: busy === "probing" ? t("cooldown.probing") : t("cooldown.probe")
+						}),
+						(onProbe !== void 0 || onReset !== void 0) && (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: FallbacksCard_module_css_default.outlineButton,
+							title: t("cooldown.resetTip"),
+							disabled: !writable || busy !== null,
+							onClick: () => {
+								if (busy === null) onReset();
+							},
+							children: busy === "clearing" ? t("cooldown.probing") : t("cooldown.reset")
+						})
+					]
+				})]
 				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("ol", {
 					className: FallbacksCard_module_css_default.poolStatusList,
 					children: rows
+				}), probeSummary !== null && probeSummary !== void 0 && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: FallbacksCard_module_css_default.hint,
+					children: probeSummary
 				}), chain.allCooling === true && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 					className: FallbacksCard_module_css_default.poolStatusNote,
 					children: t("cooldown.allCooling")
@@ -2795,6 +2940,22 @@ window.__ModuleLoader__.load({
 			const poolsDirty = JSON.stringify(draft.pools) !== JSON.stringify(state.config.pools ?? []);
 			const cooldown = state.cooldown;
 			const cooldownOfPool = (id) => cooldown === void 0 || id === "" ? void 0 : cooldown.pools.find((entry) => entry.id === id);
+			/**
+			* Probe tally for ONE chain. Each status strip owns its own summary, so
+			* probing a pool never rewrites the counts shown under the default chain.
+			*/
+			const probeSummaryOf = (scope) => {
+				const rows = state.probeResults.filter((row) => cooldownRowScope(row) === scope);
+				if (rows.length === 0) return null;
+				return t("cooldown.probeSummary", {
+					count: rows.length,
+					ok: rows.filter((row) => row.ok === true).length,
+					benched: rows.filter((row) => row.ok !== true && row.benched === true).length,
+					inconclusive: rows.filter((row) => row.ok !== true && row.benched !== true).length
+				});
+			};
+			/** The busy flag that belongs to ONE strip; another chain's run never disables it. */
+			const busyOf = (scope) => state.cooldownBusyScope === scope ? state.cooldownBusy : null;
 			const advancedDirty = JSON.stringify([
 				draft.triggerCodes,
 				draft.cooldownMs,
@@ -3088,6 +3249,32 @@ window.__ModuleLoader__.load({
 			};
 			const removePool = (index) => {
 				setPoolRows((rows) => rows.filter((_, rowIndex) => rowIndex !== index));
+			};
+			const [draggedPoolIndex, setDraggedPoolIndex] = (0, react.useState)(null);
+			const [overPoolIndex, setOverPoolIndex] = (0, react.useState)(null);
+			const reorderPoolRow = (from, to) => {
+				setPoolRows((rows) => {
+					if (from === to || from < 0 || to < 0 || from >= rows.length || to >= rows.length) return rows;
+					const next = rows.map((row) => ({ ...row }));
+					const [moved] = next.splice(from, 1);
+					next.splice(to, 0, moved);
+					return next;
+				});
+			};
+			const [draggedSelector, setDraggedSelector] = (0, react.useState)(null);
+			const [overSelector, setOverSelector] = (0, react.useState)(null);
+			const reorderPoolSelector = (poolIndex, from, to) => {
+				setPoolRows((rows) => rows.map((row, index) => {
+					if (index !== poolIndex) return row;
+					if (from === to || from < 0 || to < 0 || from >= row.selectors.length || to >= row.selectors.length) return row;
+					const next = row.selectors.slice();
+					const [moved] = next.splice(from, 1);
+					next.splice(to, 0, moved);
+					return {
+						...row,
+						selectors: next
+					};
+				}));
 			};
 			const saving = state.status === "saving";
 			const writable = state.writable;
@@ -3677,7 +3864,16 @@ window.__ModuleLoader__.load({
 												/* @__PURE__ */ (0, react_jsx_runtime.jsx)(PoolChainStatus, {
 													chain: cooldown?.defaultPool,
 													t,
-													configuredProviders: state.configuredProviders
+													configuredProviders: state.configuredProviders,
+													writable,
+													busy: busyOf("Auto"),
+													probeSummary: probeSummaryOf("Auto"),
+													onReset: () => {
+														controller.clearCooldowns("Auto");
+													},
+													onProbe: () => {
+														controller.probeRoutes("Auto");
+													}
 												}),
 												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 												className: FallbacksCard_module_css_default.chainSelectors,
@@ -3770,11 +3966,40 @@ window.__ModuleLoader__.load({
 											const poolExpanded = !row.collapsed || !writable;
 											const poolSummary = row.selectors.map(selectorRowToRaw).find((entry) => entry !== "") ?? t("pools.chainHint");
 											return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: FallbacksCard_module_css_default.editorCard,
-												children: [
+												className: [FallbacksCard_module_css_default.editorCard, draggedPoolIndex === index ? FallbacksCard_module_css_default.slotCardDragging : null, overPoolIndex === index && draggedPoolIndex !== null && draggedPoolIndex !== index ? FallbacksCard_module_css_default.slotCardOver : null].filter(Boolean).join(" "),
+												onDragOver: (event) => {
+													event.preventDefault();
+													if (writable) setOverPoolIndex(index);
+												},
+												onDragLeave: () => {
+													setOverPoolIndex((current) => current === index ? null : current);
+												},
+												onDrop: (event) => {
+													event.preventDefault();
+													const from = draggedPoolIndex;
+													setDraggedPoolIndex(null);
+													setOverPoolIndex(null);
+													if (from !== null && from !== index) reorderPoolRow(from, index);
+												},												children: [
 													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 													className: FallbacksCard_module_css_default.collapseRow,
-													children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+													children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+														type: "button",
+														className: FallbacksCard_module_css_default.dragHandle,
+														draggable: writable,
+														title: t("pools.drag"),
+														"aria-label": t("pools.drag"),
+														disabled: !writable,
+														onDragStart: () => {
+															setDraggedPoolIndex(index);
+															setOverPoolIndex(index);
+														},
+														onDragEnd: () => {
+															setDraggedPoolIndex(null);
+															setOverPoolIndex(null);
+														},
+														children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)(GripIcon, {})
+													}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
 														type: "button",
 														className: FallbacksCard_module_css_default.collapseToggle,
 														"aria-expanded": poolExpanded,
@@ -3795,10 +4020,19 @@ window.__ModuleLoader__.load({
 															})
 														]
 													})
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(PoolChainStatus, {
+												]}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(PoolChainStatus, {
 														chain: cooldownOfPool(poolId),
 														t,
-														configuredProviders: state.configuredProviders
+														configuredProviders: state.configuredProviders,
+														writable,
+														busy: busyOf(poolId),
+														probeSummary: poolId === "" ? null : probeSummaryOf(poolId),
+														onReset: poolId === "" ? void 0 : () => {
+															controller.clearCooldowns(poolId);
+														},
+														onProbe: poolId === "" ? void 0 : () => {
+															controller.probeRoutes(poolId);
+														}
 													}), poolExpanded && /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
 													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 														className: FallbacksCard_module_css_default.ruleGrid,
@@ -3855,7 +4089,42 @@ window.__ModuleLoader__.load({
 																	},
 																	onRemove: () => {
 																		removePoolSelector(index, selectorIndex);
-																	}
+																	},
+																		drag: row.selectors.length < 2 ? void 0 : {
+																			disabled: !writable,
+																			label: t("pools.drag"),
+																			dragging: draggedSelector !== null && draggedSelector.pool === index && draggedSelector.index === selectorIndex,
+																			over: overSelector !== null && overSelector.pool === index && overSelector.index === selectorIndex && draggedSelector !== null && !(draggedSelector.pool === index && draggedSelector.index === selectorIndex),
+																			onStart: () => {
+																				setDraggedSelector({
+																					pool: index,
+																					index: selectorIndex
+																				});
+																				setOverSelector({
+																					pool: index,
+																					index: selectorIndex
+																				});
+																			},
+																			onEnd: () => {
+																				setDraggedSelector(null);
+																				setOverSelector(null);
+																			},
+																			onOver: () => {
+																				if (writable) setOverSelector({
+																					pool: index,
+																					index: selectorIndex
+																				});
+																			},
+																			onLeave: () => {
+																				setOverSelector((current) => current !== null && current.pool === index && current.index === selectorIndex ? null : current);
+																			},
+																			onDrop: () => {
+																				const from = draggedSelector;
+																				setDraggedSelector(null);
+																				setOverSelector(null);
+																				if (from !== null && from.pool === index && from.index !== selectorIndex) reorderPoolSelector(index, from.index, selectorIndex);
+																			}
+																		}
 																}, selectorIndex))
 															}),
 															/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {

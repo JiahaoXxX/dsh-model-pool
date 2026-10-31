@@ -1431,6 +1431,12 @@ var CooldownStore = class {
 	keys() {
 		return this.entries.keys();
 	}
+	remove(key) {
+		this.entries.delete(key);
+	}
+	clear() {
+		this.entries.clear();
+	}
 	snapshot(now = Date.now()) {
 		const active = [];
 		for (const [key, until] of this.entries) {
@@ -1547,7 +1553,7 @@ var FallbackStateStore = class {
 		for (const key of state.cooldown.keys()) this.isSuppressed(state, key, now, mode);
 	}
 	observeSuccess(state, key, now = Date.now()) {
-		if (state.cooldown.peek(key) !== void 0) this.isSuppressed(state, key, now, "half-open");
+		state.cooldown.remove(key);
 		state.recovery.close(key);
 	}
 };
@@ -1611,12 +1617,16 @@ var FallbacksConfigGateway = class extends TypertRemoteService {
 	settings;
 	subagentPolicy;
 	cooldown;
-	constructor(ctx, bridge, seeds, subagentPolicy, cooldown) {
+	resetCool;
+	probeSeam;
+	constructor(ctx, bridge, seeds, subagentPolicy, cooldown, resetCool, probeSeam) {
 		super(ctx, "fallbacks");
 		this.bridge = bridge;
 		this.seeds = seeds;
 		this.subagentPolicy = subagentPolicy;
 		this.cooldown = cooldown;
+		this.resetCool = resetCool;
+		this.probeSeam = probeSeam;
 		ctx.inject(["settings"], (sctx) => {
 			this.settings = sctx.settings;
 			return () => {
@@ -1680,6 +1690,31 @@ var FallbacksConfigGateway = class extends TypertRemoteService {
 		if (settings === void 0) throw new Error("fallbacks: settings service is unavailable — configuration cannot be written");
 		await settings.replace(FALLBACKS_PROFILE_ENTRY, {});
 		return this.readResult();
+	}
+	/**
+	 * Drop every benched route immediately (per-agent cooldowns + the
+	 * probe-discovered global benches) so the chain is usable again without
+	 * waiting for `cooldownMs`. Volatile runtime state only — the written
+	 * configuration is untouched.
+	 */
+	async clearCooldowns(scope) {
+		this.resetCool?.(scope);
+		return this.status();
+	}
+	/**
+	 * Probe every configured route once and bench the ones that fail, so a dead
+	 * source is skipped on the first real request instead of costing a failed
+	 * turn. Returns the freshly composed status projection plus one row per
+	 * probed route.
+	 */
+	async probe(scope) {
+		if (this.probeSeam === void 0) throw new Error("fallbacks: route probe is unavailable on this fiber");
+		const results = await this.probeSeam(scope);
+		return {
+			...this.status(),
+			probedAt: Date.now(),
+			results
+		};
 	}
 	async revertSeed(id) {
 		if (typeof id !== "string") throw new TypeError("dsh-llm-fallbacks: seed revert id must be a string");
@@ -1909,6 +1944,35 @@ function fallbacksTypertContribution() {
 				parameters: [{
 					name: "id",
 					wire: "id",
+					source: "json",
+					codec: { mode: "src-json" }
+				}],
+				result: { mode: "src-json" }
+			},
+			{
+				id: "dsh-model-pool#fallbacks/clear-cooldowns",
+				service: "fallbacks",
+				namespace: "fallbacks",
+				method: "clear-cooldowns",
+				implementation: "clearCooldowns",
+				invocation: { kind: "direct" },
+				parameters: [{
+					name: "scope",
+					wire: "scope",
+					source: "json",
+					codec: { mode: "src-json" }
+				}],
+				result: { mode: "src-json" }
+			},
+			{
+				id: "dsh-model-pool#fallbacks/probe",
+				service: "fallbacks",
+				namespace: "fallbacks",
+				method: "probe",
+				invocation: { kind: "direct" },
+				parameters: [{
+					name: "scope",
+					wire: "scope",
 					source: "json",
 					codec: { mode: "src-json" }
 				}],
@@ -3322,6 +3386,51 @@ const name = "llm-fallbacks";
 const provide = ["llm-fallbacks"];
 const { version } = createRequire(import.meta.url)("../package.json");
 const CONTEXT_WINDOW_EXCEEDED_CODE = "CONTEXT_WINDOW_EXCEEDED";
+/** One-shot connectivity probe: prompt, per-route budget, and the code recorded on timeout. */
+const PROBE_PROMPT = "Reply with the single word OK.";
+const PROBE_TIMEOUT_MS = 6e3;
+/**
+ * How long a TRANSIENT failure may bench a route. A timeout, a transport blip or
+ * a rate limit says nothing about whether the source can serve, so it gets a
+ * short soft bench instead of the full cooldownMs window: the route comes back
+ * on its own shortly instead of being buried for hours on one bad round trip.
+ */
+const TRANSIENT_BENCH_MS = 6e4;
+/**
+* Outcome codes a probe must NOT treat as proof of a dead source: a timeout, an
+* abort, a transport blip or an upstream rate limit says nothing about whether
+* the route can serve, and benching on those buries a healthy source for the
+* whole cooldown window. Only a code outside this set counts as a real verdict.
+*/
+const PROBE_TRANSIENT_CODES = new Set([
+  "TIMEOUT",
+  "ABORTED",
+  "TRANSPORT",
+  "NETWORK_ERROR",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "RATE_LIMITED",
+  "RATE_LIMIT",
+  "RATE_LIMIT_EXCEEDED",
+  "TOO_MANY_REQUESTS",
+  "OVERLOADED",
+  "OVERLOADED_ERROR",
+  "UNAVAILABLE",
+  "SERVER_ERROR",
+  "INTERNAL_ERROR",
+  "BAD_GATEWAY",
+  "SERVICE_UNAVAILABLE",
+  "UPSTREAM_TIMEOUT",
+  "UPSTREAM_ERROR",
+  "SERVER",
+  "EMPTY_RESPONSE",
+  "ACCOUNT_SIGNED_OUT"
+]);
 const REQUEST_SCOPED_CODES = new Set([CONTEXT_WINDOW_EXCEEDED_CODE]);
 const stateStores = new WeakMap();
 function stateStore(ctx) {
@@ -3344,7 +3453,7 @@ function chainHeads(ctx) {
  * LATEST expiry and `halfOpen` is the logical OR, which is the conservative
  * reading of "somebody is still waiting on this route".
  */
-function cooldownViewOf(states, now, recovery) {
+function cooldownViewOf(states, now, recovery, extra) {
 	const view = new Map();
 	if (states === void 0) return view;
 	const absorb = (key, untilEpochMs, halfOpen) => {
@@ -3364,6 +3473,7 @@ function cooldownViewOf(states, now, recovery) {
 		if ((recovery ?? "timer") !== "half-open") continue;
 		for (const entry of state.recovery.halfOpenEntries()) absorb(entry.key, entry.untilEpochMs, true);
 	}
+	if (extra !== void 0) for (const row of extra.snapshot(now)) absorb(row.key, row.untilEpochMs, false);
 	return view;
 }
 /**
@@ -3636,7 +3746,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		if (settingsComposed !== void 0) return settingsComposed;
 		return entry;
 	};
-	const { reconcile: reconcileFallbacksAdapter, notifyAdaptersUpdated } = installFallbacksAdapter(ctx, () => source(), () => cooldownViewOf(stateStores.get(ctx), Date.now(), source().recovery ?? "timer"));
+	const { reconcile: reconcileFallbacksAdapter, notifyAdaptersUpdated } = installFallbacksAdapter(ctx, () => source(), () => cooldownViewOf(stateStores.get(ctx), Date.now(), source().recovery ?? "timer", globalCooldowns));
 	validateFallbacksConfig(entry, logger);
 	const legacyKeys = detectLegacyKeys(source());
 	if (legacyKeys.length > 0) logger.warn("llm-fallbacks: legacy config keys detected (chains/roles.default/undeclared role refs); see docs/configuration.md migration table — %o", legacyKeys);
@@ -3644,6 +3754,13 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	/** agentId -> the named pool id this session's virtual seed resolved to. */
 	const servedPools = new Map();
 	let hasChains = entry.rootChain.length > 0 || (entry.pools?.length ?? 0) > 0 || entry.roles.list.some((role) => (role.chain?.length ?? 0) > 0);
+	/**
+	 * Routes benched by an explicit connectivity probe (or by any session-wide
+	 * verdict). Per-agent cooldowns live in `FallbackStateStore`; this one is
+	 * cross-session on purpose — a dead endpoint is dead for everyone, and the
+	 * probe exists so the FIRST real request does not have to discover it.
+	 */
+	const globalCooldowns = new CooldownStore();
 	ctx.inject(["settings"], (sctx) => {
 		const settings = sctx.settings;
 		const refreshComposed = () => {
@@ -3660,6 +3777,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 			reconcileFallbacksAdapter();
 			slotWinners.clear();
 			servedPools.clear();
+			globalCooldowns.clear();
 		});
 		return () => {
 			disposeDocumentUpdated();
@@ -3691,7 +3809,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 			} catch {
 				return { policy: { state: "unprovable" } };
 			}
-		}, () => cooldownViewOf(stateStores.get(ctx), Date.now(), source().recovery ?? "timer"));
+		}, () => cooldownViewOf(stateStores.get(ctx), Date.now(), source().recovery ?? "timer", globalCooldowns), (scope) => clearAllCooldowns(scope), (scope) => probeRoutes(scope));
 	} catch (error) {
 		if (!(error instanceof Error) || !error.message.includes("has been registered")) throw error;
 		ctx.logger("llm-fallbacks").debug("fallbacks gateway already registered — no gateway on this fiber (multi-fiber dedupe)");
@@ -3726,6 +3844,178 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		}
 		return agent.session?.header?.origin === "subagent" ? config.rootChain : resolveEffectiveChain(config, new Date(), config.tz ?? "Asia/Shanghai");
 	}
+	/**
+	 * True when the session is riding a route the USER chose by hand, which the
+	 * fallback machinery must then leave alone.
+	 *
+	 * The virtual `ModelPool` picker rows are the opposite case: `Auto` and every
+	 * named pool are routing CONTRACTS, so a failure there is exactly what this
+	 * plugin exists to handle. A concrete `provider/model` that is not the head of
+	 * the all-day chain is an explicit manual choice — switching away from it is
+	 * the hijack reported against 0.1.x, so the request is passed through
+	 * untouched.
+	 */
+	function manualChoiceWins(agent, current, config) {
+		if (current.model === void 0 || current.model === "") return false;
+		if (isVirtualModelId(config, current.model)) return false;
+		if (agent.session?.header?.origin === "subagent") return false;
+		const head = effectiveHeadOfModel(config, FALLBACKS_CHAIN_MODEL, new Date());
+		if (head !== void 0 && head.provider === current.provider && head.model === current.model) return false;
+		return true;
+	}
+	/** Drop every bench (per-agent + probe-discovered) so the chain is usable again. */
+	/**
+	 * Resolve the chains a scope owns. An empty scope means "every chain", the
+	 * virtual Auto id means the effective root chain, and anything else names a
+	 * pool. An unknown pool owns nothing.
+	 */
+	function scopeChains(config, scope) {
+		if (typeof scope !== "string" || scope === "") {
+			const chains = [config.rootChain];
+			for (const pool of config.pools ?? []) if (pool !== null && typeof pool === "object" && Array.isArray(pool.chain)) chains.push(pool.chain);
+			return chains;
+		}
+		if (scope === FALLBACKS_CHAIN_MODEL) return [resolveEffectiveChain(config, new Date(), config.tz ?? "Asia/Shanghai")];
+		const pool = findPool(config, scope);
+		return pool === void 0 ? [] : [pool.chain];
+	}
+	/**
+	 * The cooldown keys a scope owns. A route that appears in several chains owns
+	 * one key, so clearing a pool clears that route everywhere: a bench belongs to
+	 * the provider route, not to the chain that happened to notice the failure.
+	 */
+	function scopeKeys(config, scope) {
+		const keys = new Set();
+		for (const chain of scopeChains(config, scope)) for (const entry of Array.isArray(chain) ? chain : []) {
+			let selector;
+			try {
+				selector = parseSelector(entry);
+			} catch {
+				continue;
+			}
+			if (selector.model === void 0 || selector.provider === FALLBACKS_PROVIDER) continue;
+			keys.add(selectorKey(selector.provider, selector.model));
+		}
+		return keys;
+	}
+	/**
+	 * Drop benches. With a scope only that chain's routes are released; without
+	 * one every bench in the process goes, which is what the first-run "nothing
+	 * is really down, forget it all" gesture wants.
+	 */
+	function clearAllCooldowns(scope) {
+		const scoped = typeof scope === "string" && scope !== "" ? scopeKeys(source(), scope) : void 0;
+		if (scoped === void 0) globalCooldowns.clear();
+		else for (const key of scoped) globalCooldowns.remove(key);
+		for (const state of states.states.values()) {
+			if (scoped === void 0) {
+				state.cooldown.clear();
+				state.recovery?.entries?.clear?.();
+				continue;
+			}
+			for (const key of scoped) {
+				state.cooldown.remove(key);
+				state.recovery?.entries?.delete?.(key);
+			}
+		}
+		notifyAdaptersUpdated();
+	}
+	/**
+	 * Ask every configured route for a one-token answer and bench the ones that
+	 * come back broken. Benches land in `globalCooldowns`, so the very first real
+	 * request already skips a dead provider instead of burning a failed turn on
+	 * it. A probe row is `{provider, model, ok, code, ms}`.
+	 */
+	async function probeRoutes(scope) {
+		const llm = ctx.get("llm");
+		if (llm === void 0) throw new Error("fallbacks: the llm service is unavailable — routes cannot be probed");
+		const config = source();
+		const routes = [];
+		const seen = new Set();
+		const collect = (chain) => {
+			for (const entry of chain ?? []) {
+				let selector;
+				try {
+					selector = parseSelector(entry);
+				} catch {
+					continue;
+				}
+				if (selector.model === void 0 || selector.provider === FALLBACKS_PROVIDER) continue;
+				const key = selectorKey(selector.provider, selector.model);
+				if (seen.has(key)) continue;
+				seen.add(key);
+				routes.push({
+					key,
+					provider: selector.provider,
+					model: selector.model
+				});
+			}
+		};
+		for (const chain of scopeChains(config, scope)) collect(chain);
+		const results = [];
+		const bench = (key, until) => globalCooldowns.suppress(key, until);
+		const unbench = (key) => globalCooldowns.remove(key);
+		for (const route of routes) {
+			const startedAt = Date.now();
+			const attemptOnce = async () => {
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+				let ok = false;
+				let code;
+				try {
+					for await (const chunk of llm.stream({
+						provider: route.provider,
+						model: route.model,
+						messages: [createUserMessage({
+							content: [{ type: "text", text: PROBE_PROMPT }],
+							source: { kind: "user" }
+						})],
+						maxTokens: 8,
+						signal: controller.signal
+					})) {
+						if (chunk.type === "finish") {
+							if (chunk.reason.kind === "stop") ok = true;
+							else code = chunk.reason.failure?.code ?? chunk.reason.kind;
+							break;
+						}
+						if (chunk.type === "text-delta") ok = true;
+					}
+				} catch (error) {
+					code = error?.code ?? error?.message ?? "TRANSPORT";
+				} finally {
+					clearTimeout(timer);
+				}
+				const aborted = controller.signal.aborted;
+				if (aborted) {
+					ok = false;
+					code = code ?? "TIMEOUT";
+				}
+				const normalized = typeof code === "string" ? code.toUpperCase() : "";
+				return {
+					ok,
+					code: ok ? void 0 : code ?? (aborted ? "TIMEOUT" : void 0),
+					conclusive: !ok && normalized !== "" && !PROBE_TRANSIENT_CODES.has(normalized)
+				};
+			};
+			let outcome = await attemptOnce();
+			if (!outcome.ok && !outcome.conclusive) outcome = await attemptOnce();
+			const ok = outcome.ok;
+			const benched = ok ? false : outcome.conclusive;
+			if (ok) unbench(route.key);
+			else if (benched) bench(route.key, Date.now() + config.cooldownMs);
+			results.push({
+				pool: typeof scope === "string" ? scope : "",
+				provider: route.provider,
+				model: route.model,
+				ok,
+				benched,
+				code: outcome.code,
+				ms: Date.now() - startedAt
+			});
+		}
+		notifyAdaptersUpdated();
+		return results;
+	}
 	async function decide(agent, turn, step, current, reason, state, failureCode) {
 		const config = source();
 		if (state !== void 0) {
@@ -3737,7 +4027,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		const { all, wildcard } = resolveChainViews(config.roles.list, rootTail, role, current.provider, current.model, logger.warn);
 		if (all.length === 0) return null;
 		const modelExists = hasWildcardEntry(config.roles.list, rootTail, role) ? await makeModelExists(ctx, [...new Set(all.map((candidate) => candidate.provider))]) : void 0;
-		const cooldown = { isSuppressed: (key) => state !== void 0 && states.isSuppressed(state, key, Date.now(), source().recovery ?? "timer") };
+		const cooldown = { isSuppressed: (key) => globalCooldowns.isSuppressed(key) || state !== void 0 && states.isSuppressed(state, key, Date.now(), source().recovery ?? "timer") };
 		const failed = { has: (key) => state !== void 0 && state.stepFailures.failed.has(key) };
 		const contextWindowOf = failureCode === CONTEXT_WINDOW_EXCEEDED_CODE ? await makeContextWindowOf(ctx, [current, ...all.flatMap((candidate) => candidate.model === void 0 ? [] : [{
 			provider: candidate.provider,
@@ -3806,13 +4096,26 @@ function apply(ctx, config = defaultFallbacksConfig) {
 			reason
 		};
 	}
+	/**
+	 * Pick the bench window for one observed failure. A code the probe layer
+	 * already regards as non-decisive (see PROBE_TRANSIENT_CODES) only earns a
+	 * short soft bench, capped by the configured cooldownMs so a user who wants
+	 * an even shorter window can shrink it. Definite verdicts keep the full
+	 * window, and always-cap decisions carry no code so they stay unchanged.
+	 */
+	function transientBenchMs(cooldownMs, code) {
+		if (code === void 0) return cooldownMs;
+		const normalized = String(code).toUpperCase();
+		return PROBE_TRANSIENT_CODES.has(normalized) ? Math.min(cooldownMs, TRANSIENT_BENCH_MS) : cooldownMs;
+	}
 	function commit(state, pending, turn, step) {
 		const config = source();
 		const fromKey = selectorKey(pending.from.provider, pending.from.model);
 		states.syncStep(state, turn, step);
 		states.writePending(state, pending);
 		if ((pending.scope ?? "route") === "route") {
-			const until = config.revertPolicy === "never" ? Number.POSITIVE_INFINITY : config.recovery === "half-open" ? Date.now() + escalatedCooldownMs(config.cooldownMs, state.recovery.recordFailure(fromKey)) : Date.now() + config.cooldownMs;
+			const benchMs = transientBenchMs(config.cooldownMs, pending.failureCode);
+			const until = config.revertPolicy === "never" ? Number.POSITIVE_INFINITY : config.recovery === "half-open" ? Date.now() + escalatedCooldownMs(benchMs, state.recovery.recordFailure(fromKey)) : Date.now() + benchMs;
 			states.suppress(state, fromKey, until);
 		}
 		states.recordFailure(state, fromKey);
@@ -3834,6 +4137,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		if (!isFallbackActive(config) || !config.triggerCodes.includes(failure.code)) return next();
 		const current = currentModel(agent, provider, config, new Date());
 		if (!current.model) return next();
+		if (manualChoiceWins(agent, current, config)) return next();
 		rememberServedPool(servedPools, agent, config);
 		try {
 			const pending = await decide(agent, turn, step, current, "trigger-code", states.peek(agent.id), failure.code);
@@ -3842,9 +4146,10 @@ function apply(ctx, config = defaultFallbacksConfig) {
 				return next();
 			}
 			const scope = REQUEST_SCOPED_CODES.has(failure.code) ? "request" : void 0;
-			commit(states.get(agent.id), scope === void 0 ? pending : {
+			commit(states.get(agent.id), {
 				...pending,
-				scope
+				...(scope === void 0 ? {} : { scope }),
+				failureCode: failure.code
 			}, turn, step);
 			return { kind: "retry" };
 		} catch (error) {
@@ -3932,6 +4237,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 				provider: seed.provider,
 				model: seed.model
 			}, new Date());
+			if (manualChoiceWins(agent, capRoute, config)) return seed;
 			const pending = await decide(agent, turn, step, capRoute, "always-cap", decisionState);
 			if (pending !== null) {
 				const commitState = states.get(agent.id);
@@ -3959,7 +4265,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	ctx.on("session/event", (session, event) => {
 		if (event.type !== "assistant/message") return;
 		const config = source();
-		if ((config.recovery ?? "timer") !== "half-open") return;
+		if (config.revertPolicy === "never") return;
 		if (event.data.interrupted === true) return;
 		const message = event.data.message;
 		if (message.source.kind !== "model") return;
@@ -3974,6 +4280,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	});
 	ctx.effect(() => () => {
 		states.clear();
+		globalCooldowns.clear();
 		dispatchInjected.clear();
 		slotWinners.clear();
 		blockedAttemptMap.clear();
