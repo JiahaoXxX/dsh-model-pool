@@ -309,6 +309,20 @@ var RecoveryStore = class {
 		if (entry === void 0 || !entry.halfOpen) return;
 		this.entries.delete(key);
 	}
+	/**
+	 * Forget a route's failure history entirely.
+	 *
+	 * {@link close} only retires a HALF-OPEN entry, because that is what a
+	 * successful probe means. But the consecutive-failure counter used to
+	 * escalate a transient bench lives on this same entry and is recorded in
+	 * every recovery mode, so a route that failed three times, recovered, and
+	 * then failed once more would be escalated straight back to the full window
+	 * on the strength of history it had already earned its way out of. A
+	 * success has to wipe the streak, not just the half-open flag.
+	 */
+	reset(key) {
+		this.entries.delete(key);
+	}
 	halfOpenEntries() {
 		const out = [];
 		for (const [key, entry] of this.entries) if (entry.halfOpen && entry.expiredUntil !== void 0) out.push({
@@ -1554,7 +1568,7 @@ var FallbackStateStore = class {
 	}
 	observeSuccess(state, key, now = Date.now()) {
 		state.cooldown.remove(key);
-		state.recovery.close(key);
+		state.recovery.reset(key);
 	}
 };
 //#endregion
@@ -1619,7 +1633,8 @@ var FallbacksConfigGateway = class extends TypertRemoteService {
 	cooldown;
 	resetCool;
 	probeSeam;
-	constructor(ctx, bridge, seeds, subagentPolicy, cooldown, resetCool, probeSeam) {
+	forceBenchSeam;
+	constructor(ctx, bridge, seeds, subagentPolicy, cooldown, resetCool, probeSeam, forceBenchSeam) {
 		super(ctx, "fallbacks");
 		this.bridge = bridge;
 		this.seeds = seeds;
@@ -1627,6 +1642,7 @@ var FallbacksConfigGateway = class extends TypertRemoteService {
 		this.cooldown = cooldown;
 		this.resetCool = resetCool;
 		this.probeSeam = probeSeam;
+		this.forceBenchSeam = forceBenchSeam;
 		ctx.inject(["settings"], (sctx) => {
 			this.settings = sctx.settings;
 			return () => {
@@ -1715,6 +1731,17 @@ var FallbacksConfigGateway = class extends TypertRemoteService {
 			probedAt: Date.now(),
 			results
 		};
+	}
+	/**
+	 * Force one route into (or out of) cooldown by hand. The per-source button
+	 * in the settings card calls this, so an operator can pull a single entry
+	 * out of a pool's rotation without editing the chain and without waiting for
+	 * the plugin's own probe to reach the same conclusion.
+	 */
+	async forceCooldown(provider, model, force) {
+		if (this.forceBenchSeam === void 0) throw new Error("fallbacks: force-cooldown is unavailable on this fiber");
+		this.forceBenchSeam(provider, model, force !== false);
+		return this.status();
 	}
 	async revertSeed(id) {
 		if (typeof id !== "string") throw new TypeError("dsh-llm-fallbacks: seed revert id must be a string");
@@ -1976,6 +2003,35 @@ function fallbacksTypertContribution() {
 					source: "json",
 					codec: { mode: "src-json" }
 				}],
+				result: { mode: "src-json" }
+			},
+			{
+				id: "dsh-model-pool#fallbacks/force-cooldown",
+				service: "fallbacks",
+				namespace: "fallbacks",
+				method: "force-cooldown",
+				implementation: "forceCooldown",
+				invocation: { kind: "direct" },
+				parameters: [
+					{
+						name: "provider",
+						wire: "provider",
+						source: "json",
+						codec: { mode: "src-json" }
+					},
+					{
+						name: "model",
+						wire: "model",
+						source: "json",
+						codec: { mode: "src-json" }
+					},
+					{
+						name: "force",
+						wire: "force",
+						source: "json",
+						codec: { mode: "src-json" }
+					}
+				],
 				result: { mode: "src-json" }
 			}
 		]
@@ -3397,6 +3453,20 @@ const PROBE_TIMEOUT_MS = 6e3;
  */
 const TRANSIENT_BENCH_MS = 6e4;
 /**
+* How many CONSECUTIVE transient failures a route may collect before its soft
+* bench is upgraded to the full cooldownMs window.
+*
+* A single timeout or rate limit deserves a short bench, but the same route
+* failing again and again is not a blip: it comes back after sixty seconds,
+* burns another turn, and hops away again, which is exactly the oscillation an
+* operator sees as a route that keeps flickering in and out of the chain. Three
+* strikes promote it to the long window so a genuinely broken source stays out
+* of the rotation instead of ping-ponging. One success on that route still
+* releases it immediately (observeSuccess), so a recovered source is not
+* punished for its history.
+*/
+const TRANSIENT_ESCALATE_AFTER = 3;
+/**
 * Outcome codes a probe must NOT treat as proof of a dead source: a timeout, an
 * abort, a transport blip or an upstream rate limit says nothing about whether
 * the route can serve, and benching on those buries a healthy source for the
@@ -3753,6 +3823,31 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	let roleIds = new Map(entry.roles.list.map((role) => [role.id.trim(), role.id]));
 	/** agentId -> the named pool id this session's virtual seed resolved to. */
 	const servedPools = new Map();
+	/**
+	 * agentId -> the concrete route this plugin switched the session TO.
+	 *
+	 * Needed because the header records the SERVED route: after one hop it holds a
+	 * concrete provider/model that is no longer the chain head, which looks exactly
+	 * like a hand-picked model. Without this memory the plugin mistakes its own
+	 * switch for a manual choice and silently refuses every later fallback.
+	 */
+	const routedTargets = new Map();
+	/**
+	 * Relinquish routing when the seed is a concrete route this plugin never chose.
+	 *
+	 * The seed is the assembled model selection, so it stays virtual (ModelPool/*)
+	 * while the pool owns the session. A concrete value that is not one of our own
+	 * switch targets therefore means the user picked a model by hand, and from that
+	 * point the pool must keep its hands off (the 0.1.x hijack report).
+	 */
+	function noteSeedRoute(agent, seed) {
+		if (seed === void 0 || seed.provider === void 0 || seed.model === void 0) return;
+		if (seed.provider === FALLBACKS_PROVIDER) return;
+		const own = routedTargets.get(agent.id);
+		if (own === void 0) return;
+		if (own.provider === seed.provider && own.model === seed.model) return;
+		routedTargets.delete(agent.id);
+	}
 	let hasChains = entry.rootChain.length > 0 || (entry.pools?.length ?? 0) > 0 || entry.roles.list.some((role) => (role.chain?.length ?? 0) > 0);
 	/**
 	 * Routes benched by an explicit connectivity probe (or by any session-wide
@@ -3809,7 +3904,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 			} catch {
 				return { policy: { state: "unprovable" } };
 			}
-		}, () => cooldownViewOf(stateStores.get(ctx), Date.now(), source().recovery ?? "timer", globalCooldowns), (scope) => clearAllCooldowns(scope), (scope) => probeRoutes(scope));
+		}, () => cooldownViewOf(stateStores.get(ctx), Date.now(), source().recovery ?? "timer", globalCooldowns), (scope) => clearAllCooldowns(scope), (scope) => probeRoutes(scope), (provider, model, force) => forceBenchRoute(provider, model, force));
 	} catch (error) {
 		if (!(error instanceof Error) || !error.message.includes("has been registered")) throw error;
 		ctx.logger("llm-fallbacks").debug("fallbacks gateway already registered — no gateway on this fiber (multi-fiber dedupe)");
@@ -3859,6 +3954,8 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		if (current.model === void 0 || current.model === "") return false;
 		if (isVirtualModelId(config, current.model)) return false;
 		if (agent.session?.header?.origin === "subagent") return false;
+		const own = routedTargets.get(agent.id);
+		if (own !== void 0 && own.provider === current.provider && own.model === current.model) return false;
 		const head = effectiveHeadOfModel(config, FALLBACKS_CHAIN_MODEL, new Date());
 		if (head !== void 0 && head.provider === current.provider && head.model === current.model) return false;
 		return true;
@@ -3917,6 +4014,39 @@ function apply(ctx, config = defaultFallbacksConfig) {
 				state.cooldown.remove(key);
 				state.recovery?.entries?.delete?.(key);
 			}
+		}
+		notifyAdaptersUpdated();
+	}
+	/**
+	 * Force ONE route in or out of cooldown by hand.
+	 *
+	 * The probe is the plugin's own opinion about a source; this is the
+	 * operator's. Someone watching a pool knows things the probe cannot see — a
+	 * source that answers a one-token ping perfectly well but returns garbage
+	 * for real work, a quota they intend to spend elsewhere today — so they need
+	 * a way to pull that one entry out of the rotation without editing the
+	 * chain. The bench uses the full cooldownMs window (not the short transient
+	 * one: this is a deliberate decision, not a bad round trip) and lands in
+	 * `globalCooldowns`, so it applies to every chain that contains the route
+	 * and to sessions that have not started yet.
+	 *
+	 * `force: false` releases the route again, which is the same operation
+	 * 重置冷却 performs for a whole pool narrowed to a single row.
+	 */
+	function forceBenchRoute(provider, model, force) {
+		if (typeof provider !== "string" || provider === "") throw new TypeError("dsh-llm-fallbacks: force-cooldown provider must be a non-empty string");
+		if (typeof model !== "string" || model === "") throw new TypeError("dsh-llm-fallbacks: force-cooldown model must be a non-empty string");
+		if (provider === FALLBACKS_PROVIDER) throw new TypeError("dsh-llm-fallbacks: force-cooldown cannot bench the virtual pool provider itself");
+		const key = selectorKey(provider, model);
+		if (force === false) globalCooldowns.remove(key);
+		else globalCooldowns.suppress(key, Date.now() + source().cooldownMs);
+		for (const state of states.states.values()) {
+			if (force === false) {
+				state.cooldown.remove(key);
+				state.recovery?.entries?.delete?.(key);
+				continue;
+			}
+			state.cooldown.suppress(key, Date.now() + source().cooldownMs);
 		}
 		notifyAdaptersUpdated();
 	}
@@ -4103,19 +4233,22 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	 * an even shorter window can shrink it. Definite verdicts keep the full
 	 * window, and always-cap decisions carry no code so they stay unchanged.
 	 */
-	function transientBenchMs(cooldownMs, code) {
+	function transientBenchMs(cooldownMs, code, consecutive) {
 		if (code === void 0) return cooldownMs;
 		const normalized = String(code).toUpperCase();
-		return PROBE_TRANSIENT_CODES.has(normalized) ? Math.min(cooldownMs, TRANSIENT_BENCH_MS) : cooldownMs;
+		if (!PROBE_TRANSIENT_CODES.has(normalized)) return cooldownMs;
+		if ((consecutive ?? 1) >= TRANSIENT_ESCALATE_AFTER) return cooldownMs;
+		return Math.min(cooldownMs, escalatedCooldownMs(Math.min(cooldownMs, TRANSIENT_BENCH_MS), consecutive ?? 1));
 	}
 	function commit(state, pending, turn, step) {
 		const config = source();
 		const fromKey = selectorKey(pending.from.provider, pending.from.model);
 		states.syncStep(state, turn, step);
 		states.writePending(state, pending);
+		const consecutive = state.recovery.recordFailure(fromKey);
 		if ((pending.scope ?? "route") === "route") {
-			const benchMs = transientBenchMs(config.cooldownMs, pending.failureCode);
-			const until = config.revertPolicy === "never" ? Number.POSITIVE_INFINITY : config.recovery === "half-open" ? Date.now() + escalatedCooldownMs(benchMs, state.recovery.recordFailure(fromKey)) : Date.now() + benchMs;
+			const benchMs = transientBenchMs(config.cooldownMs, pending.failureCode, consecutive);
+			const until = config.revertPolicy === "never" ? Number.POSITIVE_INFINITY : config.recovery === "half-open" ? Date.now() + escalatedCooldownMs(benchMs, consecutive) : Date.now() + benchMs;
 			states.suppress(state, fromKey, until);
 		}
 		states.recordFailure(state, fromKey);
@@ -4159,9 +4292,16 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	});
 	ctx.on("agent/request", async ({ agent, turn, step }, next) => {
 		const seed = await next();
+		noteSeedRoute(agent, seed);
 		const state = states.peek(agent.id);
 		const applied = state === void 0 ? void 0 : states.applyPending(state, turn, step);
-		if (applied !== void 0) return overrideConfig(seed, applied.to);
+		if (applied !== void 0) {
+			routedTargets.set(agent.id, {
+				provider: applied.to.provider,
+				model: applied.to.model
+			});
+			return overrideConfig(seed, applied.to);
+		}
 		const config = source();
 		if (isFallbackActive(config) && isAllDayConforming(config.rootChain) && (config.timeSlots?.length ?? 0) > 0 && agent.session?.header?.origin !== "subagent") {
 			const slot = resolveSlotState(config, new Date(), config.tz ?? "Asia/Shanghai");
@@ -4243,7 +4383,13 @@ function apply(ctx, config = defaultFallbacksConfig) {
 				const commitState = states.get(agent.id);
 				commit(commitState, pending, turn, step);
 				const appliedCap = states.applyPending(commitState, turn, step);
-				if (appliedCap !== void 0) return overrideConfig(seed, appliedCap.to);
+				if (appliedCap !== void 0) {
+					routedTargets.set(agent.id, {
+						provider: appliedCap.to.provider,
+						model: appliedCap.to.model
+					});
+					return overrideConfig(seed, appliedCap.to);
+				}
 			} else failHalfOpenProbe(agent.id, capRoute);
 		}
 		return seed;
@@ -4261,6 +4407,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		chainHeadMap.delete(agent.id);
 		subagentSeam.records.delete(agent.id);
 		lastKnownPolicySettings.delete(agent.id);
+		routedTargets.delete(agent.id);
 	});
 	ctx.on("session/event", (session, event) => {
 		if (event.type !== "assistant/message") return;
@@ -4281,6 +4428,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	ctx.effect(() => () => {
 		states.clear();
 		globalCooldowns.clear();
+		routedTargets.clear();
 		dispatchInjected.clear();
 		slotWinners.clear();
 		blockedAttemptMap.clear();
