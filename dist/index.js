@@ -700,6 +700,39 @@ function fitsContextWindow(candidate, minContextWindow, contextWindowOf) {
 	const candidateWindow = contextWindowOf(candidate.provider, candidate.model);
 	return candidateWindow === void 0 || candidateWindow > minContextWindow;
 }
+/**
+ * The least-bad candidate when NOTHING survived the normal filter because every
+ * route is benched. A bench is a prediction, not a verdict — a route that a
+ * transient failure benched may well serve again immediately — so refusing to
+ * switch and surfacing the raw failure is strictly worse than trying the route
+ * whose bench expires first. Already-failed-in-this-step routes are still
+ * excluded so a single step cannot ping-pong forever.
+ */
+function leastBadCandidate(all, wildcard, options) {
+	const { current, cooldown, failed, contextWindowOf, minContextWindow, modelExists } = options;
+	const usable = [];
+	for (let index = 0; index < all.length; index += 1) {
+		const candidate = all[index];
+		if (candidate.provider === current.provider && candidate.model === current.model) continue;
+		if (candidate.model === void 0) continue;
+		if (failed.has(selectorKey(candidate.provider, candidate.model))) continue;
+		if (!fitsContextWindow(candidate, minContextWindow, contextWindowOf)) continue;
+		if (modelExists && wildcard[index] && !modelExists(candidate.provider, candidate.model)) continue;
+		usable.push(candidate);
+	}
+	if (usable.length === 0) return void 0;
+	let best = usable[0];
+	let bestAt = Number.POSITIVE_INFINITY;
+	for (const candidate of usable) {
+		const at = cooldown.releaseAt?.(selectorKey(candidate.provider, candidate.model));
+		const key = typeof at === "number" && Number.isFinite(at) ? at : Number.POSITIVE_INFINITY;
+		if (key < bestAt) {
+			bestAt = key;
+			best = candidate;
+		}
+	}
+	return best;
+}
 function createCandidateFilter(options) {
 	const { current, cooldown, failed, modelExists, minContextWindow, contextWindowOf } = options;
 	return (candidate) => {
@@ -3003,13 +3036,53 @@ function firstDispatchableExactHead(chain, isCooling) {
 }
 /**
  * The head a request will ACTUALLY hit: the first entry that is not cooling
- * down, else the first entry of the chain (everything is benched, so a cooled
- * head is still the least-bad target — and the only way a half-open probe can
- * ever fire).
+ * down. When EVERY entry is benched there is no live head, so rank the dead
+ * ones by when their bench is released and take the earliest. chain[0] may be
+ * benched for the entire window while the last entry comes back in a minute,
+ * so blind chain order aims a fully-benched pool at its worst target. Ties keep
+ * chain order, and an entry whose release time is unreadable ranks LAST so an
+ * unknown bench never beats a known short one.
  */
 function liveOrAnyHead(chain, isCooling) {
 	if (isCooling === void 0) return firstDispatchableExactHead(chain);
-	return firstDispatchableExactHead(chain, isCooling) ?? firstDispatchableExactHead(chain);
+	const live = firstDispatchableExactHead(chain, isCooling);
+	if (live !== void 0) return live;
+	return soonestReleaseHead(chain, isCooling);
+}
+/**
+ * The dispatchable entry of `chain` whose cooldown is released first, or
+ * undefined when the chain has no dispatchable entry at all.
+ */
+function soonestReleaseHead(chain, isCooling) {
+	const releaseOf = isCooling.releaseAt;
+	let best;
+	let bestAt = Number.POSITIVE_INFINITY;
+	for (const entry of chain) {
+		let selector;
+		try {
+			selector = parseSelector(entry);
+		} catch {
+			continue;
+		}
+		if (selector.model === void 0) continue;
+		if (selector.provider === FALLBACKS_PROVIDER) continue;
+		const at = typeof releaseOf === "function" ? releaseOf(selector.provider, selector.model) : void 0;
+		if (typeof at === "number" && Number.isFinite(at)) {
+			if (at < bestAt) {
+				bestAt = at;
+				best = {
+					provider: selector.provider,
+					model: selector.model
+				};
+			}
+			continue;
+		}
+		if (best === void 0 && bestAt === Number.POSITIVE_INFINITY) best = {
+			provider: selector.provider,
+			model: selector.model
+		};
+	}
+	return best;
 }
 function effectiveHeadOf(config, now, isCooling) {
 	if (!isAllDayConforming(config.rootChain)) return void 0;
@@ -3266,7 +3339,9 @@ var ModelPoolAdapter = class extends LlmAdapter {
 	coolingPredicate(config) {
 		const view = this.readCooldown?.() ?? new Map();
 		if (view.size === 0) return void 0;
-		return (provider, model) => view.has(selectorKey(provider, model));
+		const predicate = (provider, model) => view.has(selectorKey(provider, model));
+		predicate.releaseAt = (provider, model) => view.get(selectorKey(provider, model))?.untilEpochMs;
+		return predicate;
 	}
 	providerInfo(provider) {
 		return {
@@ -4157,7 +4232,15 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		const { all, wildcard } = resolveChainViews(config.roles.list, rootTail, role, current.provider, current.model, logger.warn);
 		if (all.length === 0) return null;
 		const modelExists = hasWildcardEntry(config.roles.list, rootTail, role) ? await makeModelExists(ctx, [...new Set(all.map((candidate) => candidate.provider))]) : void 0;
-		const cooldown = { isSuppressed: (key) => globalCooldowns.isSuppressed(key) || state !== void 0 && states.isSuppressed(state, key, Date.now(), source().recovery ?? "timer") };
+		const cooldown = {
+			isSuppressed: (key) => globalCooldowns.isSuppressed(key) || state !== void 0 && states.isSuppressed(state, key, Date.now(), source().recovery ?? "timer"),
+			releaseAt: (key) => {
+				const bench = state?.cooldown?.peek?.(key);
+				const global = globalCooldowns.peek(key);
+				const known = [bench, global].filter((until) => typeof until === "number" && Number.isFinite(until));
+				return known.length === 0 ? void 0 : Math.min(...known);
+			}
+		};
 		const failed = { has: (key) => state !== void 0 && state.stepFailures.failed.has(key) };
 		const contextWindowOf = failureCode === CONTEXT_WINDOW_EXCEEDED_CODE ? await makeContextWindowOf(ctx, [current, ...all.flatMap((candidate) => candidate.model === void 0 ? [] : [{
 			provider: candidate.provider,
@@ -4171,7 +4254,22 @@ function apply(ctx, config = defaultFallbacksConfig) {
 			minContextWindow,
 			contextWindowOf
 		}), modelExists);
-		const first = surviving[0];
+		let first = surviving[0];
+		if (first === void 0) {
+			const leastBad = leastBadCandidate(all, wildcard, {
+				current,
+				cooldown,
+				failed,
+				contextWindowOf,
+				minContextWindow,
+				modelExists
+			});
+			if (leastBad !== void 0) {
+				logger.warn("llm-fallbacks: agent \"%s\" every candidate is benched — falling back to %s/%s (soonest release) instead of surfacing the raw failure", agent.id, leastBad.provider, leastBad.model);
+				first = leastBad;
+			}
+		}
+		const selected = first !== void 0 && surviving.length === 0 ? [first] : surviving;
 		let target;
 		if (first !== void 0 && first.model !== void 0) target = {
 			provider: first.provider,
@@ -4185,7 +4283,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 				return null;
 			}
 			if (policy.state === "enabled") {
-				const allowed = firstAllowedCandidate(resolvedRoutes(surviving), policy.allowedModels);
+				const allowed = firstAllowedCandidate(resolvedRoutes(selected), policy.allowedModels);
 				if (allowed === void 0) {
 					logger.warn("llm-fallbacks: agent \"%s\" fallback switch %s/%s blocked: resolved candidates are all outside the subagent allowlist — no switch", agent.id, target.provider, target.model);
 					blockedAttemptMap.set(agent.id, {
@@ -4206,7 +4304,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		}
 		if (target === void 0) return null;
 		if ((source().recovery ?? "timer") === "half-open" && state !== void 0 && state.recovery.tryMarkProbeLogged(selectorKey(target.provider, target.model))) logger.info("llm-fallbacks: agent \"%s\" half-open probe %s/%s (role=%s, reason=%s)", agent.id, target.provider, target.model, role, reason);
-		logger.info("llm-fallbacks: agent \"%s\" fallback switch (降级切换) %s/%s -> %s/%s (role=%s, reason=%s, candidates=%o)", agent.id, current.provider, current.model, target.provider, target.model, role, reason, annotateCandidates(all, surviving, {
+		logger.info("llm-fallbacks: agent \"%s\" fallback switch (降级切换) %s/%s -> %s/%s (role=%s, reason=%s, candidates=%o)", agent.id, current.provider, current.model, target.provider, target.model, role, reason, annotateCandidates(all, selected, {
 			current,
 			cooldown,
 			failed,
@@ -4265,9 +4363,55 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		states.suppress(state, key, Date.now() + escalatedCooldownMs(source().cooldownMs, n));
 		notifyAdaptersUpdated();
 	}
+	/**
+	 * Codes different providers use for the same underlying condition. Without
+	 * this, a configured trigger such as `AUTH` silently never fires when Trae
+	 * answers with its own lowercase `authentication`, and `upstream_error`
+	 * never fires for Trae's `upstream` — the pool then looks "locked" because
+	 * the failure it was supposed to act on is not recognised at all.
+	 */
+	function canonicalTriggerCode(code) {
+		const normalized = String(code).toUpperCase().replace(/[\s-]+/g, "_");
+		switch (normalized) {
+			case "AUTHENTICATION":
+			case "AUTHORIZATION":
+			case "INVALID_CREDENTIAL":
+			case "ACCOUNT_SIGN_IN_REQUIRED":
+			case "WORKBUDDY_CREDENTIAL_REJECTED":
+			case "UNSUPPORTED_REGION":
+			case "UNAUTHORIZED":
+				return "AUTH";
+			case "ACCOUNT_QUOTA":
+			case "INSUFFICIENT_QUOTA":
+			case "QUOTA_EXCEEDED":
+			case "HARD_CREDIT":
+				return "QUOTA";
+			case "SOFT_RATE":
+			case "TOO_MANY_REQUESTS":
+			case "BUSY":
+			case "CHANNEL_REJECT":
+				return "RATE_LIMIT";
+			case "UPSTREAM":
+			case "UPSTREAM_ERROR":
+			case "PI_AI_ERROR":
+			case "INTERNAL":
+				return "SERVER";
+			case "STREAM_CLOSED":
+			case "CONNECTION_RESET":
+				return "TRANSPORT";
+			default:
+				return normalized;
+		}
+	}
+	/** True when any configured trigger names this failure's condition. */
+	function matchesTriggerCode(triggerCodes, code) {
+		if (code === void 0 || code === "") return false;
+		const actual = canonicalTriggerCode(code);
+		return (triggerCodes ?? []).some((trigger) => canonicalTriggerCode(trigger) === actual);
+	}
 	ctx.on("agent/request-error", async ({ agent, turn, step, provider, failure }, next) => {
 		const config = source();
-		if (!isFallbackActive(config) || !config.triggerCodes.includes(failure.code)) return next();
+		if (!isFallbackActive(config) || !matchesTriggerCode(config.triggerCodes, failure.code)) return next();
 		const current = currentModel(agent, provider, config, new Date());
 		if (!current.model) return next();
 		if (manualChoiceWins(agent, current, config)) return next();

@@ -1626,6 +1626,7 @@ window.__ModuleLoader__.load({
 			"roleAutoMatch.tooltip": "规则未命中时，模型会自动从已声明角色（id + persona）中选择最匹配者并注入该角色的链；关闭后未命中规则时按现状回落（inherit / rootChain）。",
 			"rootChain.label": "模型池（降级链）",
 			"rootChain.tooltip": "未命中任何分时槽时先走这条池链；按顺序逐条降级，任意 provider/model 都可以放在链尾。",
+			"rootChain.drag": "拖动调整优先级",  /* zh label */
 			"pools.label": "命名池",
 			"pools.tooltip": "每个命名池会在模型选择器里单独显示为 ModelPool/<池 id>，选中后只在这个池内部降级；池走完仍失败就报错，不会回落到上面的模型池（降级链）。",
 			"pools.empty": "还没有命名池。添加后即可在模型选择器中直接选择 ModelPool/<池 id>。",
@@ -1672,6 +1673,8 @@ window.__ModuleLoader__.load({
 			"chains.selector.modelPlaceholder": "选择 model",
 			"chains.selector.wildcardLegacy": "该条目为通配（provider/*）：选择具体模型后将转为精确条目",
 			"chains.selector.noModelsStrict": "该 provider 暂无可用模型（目录查询失败），请改选其他 provider。",
+			"chains.selector.modelFreeform": "该 provider 没有可用模型目录，可以在下方直接手填 model id。",
+			"chains.selector.modelFreeformPlaceholder": "手填 model id",
 			"mainAgent.label": "默认池",
 			"subagents.label": "子代理",
 			"subagents.policy.label": "宿主子代理模型策略",
@@ -1785,6 +1788,7 @@ window.__ModuleLoader__.load({
 			"validation.slotPresetDuplicate": "预设 \"{preset}\" 已存在：每个预设只能添加一行",
 			"validation.slotPresetFrozen": "预设窗口是冻结代码常量：预设行不能携带 start/end/days",
 			"validation.selector": "选择器 \"{entry}\" 非法：{message}",
+			"validation.modelMissing": "选择器 \"{entry}\" 写的是 provider，但没填 model：请补成 \"{entry}/模型名\"。",
 			"legacy.banner": "检测到旧格式配置字段（{keys}）：已按新模型展示，请按 docs/configuration.md 迁移表手工改写；插件不会自动改写配置。",
 			"catalog.empty": "暂无可用模型：请先在模型页添加模型，添加后此处将自动可选。",
 			"catalog.error": "模型目录读取失败：{message}",
@@ -1863,6 +1867,7 @@ window.__ModuleLoader__.load({
 			"roleAutoMatch.tooltip": "When no rule matches, the model auto-selects the best-fit declared role (id + persona) and uses its chain; turn off to keep today's fallback (inherit / rootChain) on a rules-miss.",
 			"rootChain.label": "Model pool (fallback chain)",
 			"rootChain.tooltip": "Walked first whenever no time slot matches; if every entry fails, the default model below is the last fallback.",
+			"rootChain.drag": "Drag to change priority",  /* en label */
 			"pools.label": "Named pools",
 			"pools.tooltip": "Each named pool appears in the model picker as its own ModelPool/<pool id> row. Selecting it switches only inside that pool; when the pool is exhausted the request fails instead of falling back to the pool chain above.",
 			"pools.empty": "No named pools yet. Add one and it shows up in the model picker as ModelPool/<pool id>.",
@@ -1909,6 +1914,8 @@ window.__ModuleLoader__.load({
 			"chains.selector.modelPlaceholder": "Select model",
 			"chains.selector.wildcardLegacy": "This entry is a wildcard (provider/*): picking a model converts it to an exact entry",
 			"chains.selector.noModelsStrict": "No models available for this provider (catalog lookup failed); pick another provider.",
+			"chains.selector.modelFreeform": "This provider has no model catalog; type the model id directly below.",
+			"chains.selector.modelFreeformPlaceholder": "Type a model id",
 			"mainAgent.label": "Default pool",
 			"subagents.label": "Subagents",
 			"subagents.policy.label": "Host subagent model policy",
@@ -2022,6 +2029,7 @@ window.__ModuleLoader__.load({
 			"validation.slotPresetDuplicate": "Preset \"{preset}\" already exists: at most one row per preset",
 			"validation.slotPresetFrozen": "Preset windows are frozen code constants: a preset row cannot carry start/end/days",
 			"validation.selector": "Invalid selector \"{entry}\": {message}",
+			"validation.modelMissing": "Selector \"{entry}\" names a provider but no model; write it as \"{entry}/model-id\".",
 			"legacy.banner": "Legacy config fields detected ({keys}): now shown in the new model — rewrite them manually following the migration table in docs/configuration.md (the plugin will not rewrite them automatically).",
 			"catalog.empty": "No models yet: add a model on the Models page first; options will appear here automatically.",
 			"catalog.error": "Model catalog read failed: {message}",
@@ -2567,10 +2575,7 @@ window.__ModuleLoader__.load({
 				for (const entry of role.chain ?? []) try {
 					parseSelector(entry);
 				} catch (error) {
-					errors.sub.push(t("validation.selector", {
-						entry,
-						message: error.message
-					}));
+					errors.sub.push(!String(entry).includes("/") ? t("validation.modelMissing", { entry }) : t("validation.selector", { entry, message: error.message }));
 				}
 				if ((role.chain ?? []).length === 0 && !seedInfo.has(role.id.trim())) errors.sub.push(t("validation.roleChainRequired", { id: role.id }));
 			}
@@ -2578,10 +2583,7 @@ window.__ModuleLoader__.load({
 			for (const entry of draft.rootChain) try {
 				parseSelector(entry);
 			} catch (error) {
-				errors.main.push(t("validation.selector", {
-					entry,
-					message: error.message
-				}));
+				errors.main.push(!String(entry).includes("/") ? t("validation.modelMissing", { entry }) : t("validation.selector", { entry, message: error.message }));
 			}
 			const declaredPoolIds = /* @__PURE__ */ new Set();
 			for (const pool of draft.pools ?? []) {
@@ -2594,10 +2596,7 @@ window.__ModuleLoader__.load({
 					const selector = parseSelector(entry);
 					if (selector.provider === "ModelPool") errors.pools.push(t("validation.poolSelfRoute", { id, entry }));
 				} catch (error) {
-					errors.pools.push(t("validation.selector", {
-						entry,
-						message: error.message
-					}));
+					errors.pools.push(!String(entry).includes("/") ? t("validation.modelMissing", { entry }) : t("validation.selector", { entry, message: error.message }));
 				}
 				if ((pool.chain ?? []).length === 0) errors.pools.push(t("validation.poolChainRequired", { id }));
 			}
@@ -2616,10 +2615,7 @@ window.__ModuleLoader__.load({
 				for (const entry of row.chain) try {
 					parseSelector(entry);
 				} catch (error) {
-					errors.main.push(t("validation.selector", {
-						entry,
-						message: error.message
-					}));
+					errors.main.push(!String(entry).includes("/") ? t("validation.modelMissing", { entry }) : t("validation.selector", { entry, message: error.message }));
 				}
 				if (row.chain.length === 0) errors.main.push(t("validation.slotChainRequired"));
 			}
@@ -2788,7 +2784,19 @@ window.__ModuleLoader__.load({
 									className: FallbacksCard_module_css_default.ruleCellLabel,
 									children: t("roles.rule.model")
 								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("select", {
+								/* @__PURE__ */ groupMissing && !providerOutside ? (0, react_jsx_runtime.jsx)("input", {
+									className: `${FallbacksCard_module_css_default.input} ${FallbacksCard_module_css_default.selectInput}`,
+									type: "text",
+									value: modelRaw,
+									placeholder: t("chains.selector.modelFreeformPlaceholder"),
+									disabled,
+									onChange: (event) => {
+										onChange({
+											model: classifyModel(providerRaw, event.target.value, catalog),
+											...selector.wildcard ? { wildcard: false } : {}
+										});
+									}
+								}) : (0, react_jsx_runtime.jsxs)("select", {
 									className: `${FallbacksCard_module_css_default.input} ${FallbacksCard_module_css_default.selectInput}`,
 									value: modelRaw,
 									disabled: modelDisabled,
@@ -2815,7 +2823,7 @@ window.__ModuleLoader__.load({
 								}),
 								groupMissing && /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									className: FallbacksCard_module_css_default.hint,
-									children: t("chains.selector.noModelsStrict")
+									children: t("chains.selector.modelFreeform")
 								})
 							]
 						})]
@@ -3213,6 +3221,19 @@ window.__ModuleLoader__.load({
 					...row,
 					selectors: row.selectors.filter((_, index) => index !== selectorIndex)
 				}));
+			};
+/* reorder mutator */
+			const reorderAllDayChainSelector = (from, to) => {
+				setAllDayChainRow((row) => {
+					if (from === to || from < 0 || to < 0 || from >= row.selectors.length || to >= row.selectors.length) return row;
+					const next = row.selectors.slice();
+					const [moved] = next.splice(from, 1);
+					next.splice(to, 0, moved);
+					return {
+						...row,
+						selectors: next
+					};
+				});
 			};
 			const updateRoleRow = (index, patch) => {
 				setRoleRows((rows) => {
@@ -3967,6 +3988,41 @@ window.__ModuleLoader__.load({
 													},
 													onRemove: () => {
 														removeAllDayChainSelector(selectorIndex);
+													},
+													drag: allDayChainRow.selectors.length < 2 ? void 0 : {  /* drag prop */
+														disabled: !writable,
+														label: t("rootChain.drag"),
+														dragging: draggedSelector !== null && draggedSelector.pool === null && draggedSelector.index === selectorIndex,
+														over: overSelector !== null && overSelector.pool === null && overSelector.index === selectorIndex && draggedSelector !== null && !(draggedSelector.pool === null && draggedSelector.index === selectorIndex),
+														onStart: () => {
+															setDraggedSelector({
+																pool: null,
+																index: selectorIndex
+															});
+															setOverSelector({
+																pool: null,
+																index: selectorIndex
+															});
+														},
+														onEnd: () => {
+															setDraggedSelector(null);
+															setOverSelector(null);
+														},
+														onOver: () => {
+															if (writable) setOverSelector({
+																pool: null,
+																index: selectorIndex
+															});
+														},
+														onLeave: () => {
+															setOverSelector((current) => current !== null && current.pool === null && current.index === selectorIndex ? null : current);
+														},
+														onDrop: () => {
+															const from = draggedSelector;
+															setDraggedSelector(null);
+															setOverSelector(null);
+															if (from !== null && from.pool === null && from.index !== selectorIndex) reorderAllDayChainSelector(from.index, selectorIndex);
+														}
 													}
 												}, selectorIndex))
 											}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {

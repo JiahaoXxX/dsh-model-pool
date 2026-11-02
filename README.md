@@ -156,8 +156,11 @@ Save the config and restart the session, then type `/fallbacks` — the read-onl
 - **Subagent role badge**: when a subagent is **dispatched with a declared role** — the `**Execute as**: <id>` field of its Assignment, the same declaration that carries the persona, and the badge's ONLY source (policy on or off) — its session shows a compact role badge next to the session's agent-preset (mode) chip in the web session header; hover shows `role → latest request route` (the route of the newest recorded request, not the dispatch-time route). Only the DECLARED header is read, so a child whose role came from another stage (`agentPreset` match, a role rule, or the LLM auto-match) but which declares no Assignment header is still routed as that role yet shows **no** badge — the badge never reports a role inferred after the fact. `inherit`/unresolved sessions render no badge. The badge is durable: it is read from the child's own session record, so it is still shown for a **settled** subagent session and **after a host restart**.
 - **Context-window-aware fallback**: `triggerCodes` accepts any dsh failure code, including `CONTEXT_WINDOW_EXCEEDED` — a request too big for the current model fails over to a candidate with a **larger** context window (candidates that cannot fit either are skipped), and because the route itself is healthy the switch is request-scoped: no cooldown, no half-open probe burned (see [Fallback triggers](#fallback-triggers-triggercodes)).
 - **Cooldown and revert**: failed / switched-away models are not re-selected during cooldown; `revertPolicy: cooldown-expiry` returns to the primary model automatically.
+- **A fully-benched chain still keeps walking**: when nothing on the chain is selectable, the plugin does not hand you the raw error — it tries the entry whose bench expires **soonest**, because a source back in 40 seconds beats one benched for five hours. Only when even the step-failed set covers the whole chain is the failure returned (see [A fully-benched chain still keeps walking](#a-fully-benched-chain-still-keeps-walking)).
+- **Triggers match by condition, not literal**: `AUTH` also catches Trae's `authentication`, `QUOTA` catches `ACCOUNT_QUOTA` / `hard_credit`, `SERVER` catches lowercase `upstream` — spelling differences between connectors no longer silently disable half of the trigger table (see [Matching is by condition, not by literal spelling](#matching-is-by-condition-not-by-literal-spelling)).
 - **Transient failures get a soft bench, and success releases it**: a failure the Harness itself calls retryable (`TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`, …) benches a route for one minute rather than the whole `cooldownMs`; a definite verdict (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `INVALID_API_KEY`, …) keeps the full window. Any completed answer from a benched route drops its bench immediately — in `timer` mode too, so a working provider is never stuck out the window. A route that keeps failing is promoted instead of re-softened: the third consecutive transient strike earns the full `cooldownMs`, so the chain stops oscillating between two sources (see [A transient failure gets a soft bench](#a-transient-failure-gets-a-soft-bench), [A repeated transient failure is promoted, not re-softened](#a-repeated-transient-failure-is-promoted-not-re-softened) and [A success releases the bench immediately](#a-success-releases-the-bench-immediately)).
 - **Manual choice wins**: a concrete model you picked yourself that is not the all-day chain head is left alone — its failures pass through to llm-retry / the original error with no switch, no cooldown and no retry override. Only the virtual `ModelPool/*` rows, the current chain head, and subagent dispatches are pool-owned — and a route the plugin itself installed is never mistaken for a manual pick, so a pool keeps walking to the last entry instead of getting pinned mid-chain (see [A manual model choice is never overridden](#a-manual-model-choice-is-never-overridden)).
+- **Catalog-less providers can still be used**: when a provider is selectable but publishes no model list (`trae-global` is the common case), the chain editor offers a free-text model field instead of a disabled dropdown, and a row missing its model is reported as a missing model rather than an invalid selector (see [Adding a provider that advertises no models](#adding-a-provider-that-advertises-no-models)).
 - **Reset cooldowns and connectivity test**: two buttons on every chain-status strip, scoped to the chain above them — one releases that chain's benches, the other probes that chain's routes with a one-token request and benches only the ones that answer with a definite provider-side failure, so a timeout or rate limit never buries a healthy source (see [Reset and connectivity test](#reset-and-connectivity-test)).
 - **Bench a single source on purpose**: every chain-status row carries its own Bench / Release button, so one route can be taken out of rotation (or restored) without waiting for it to fail and without touching the rest of the chain (see [Benching one source on purpose](#benching-one-source-on-purpose)).
 - **Drag-and-drop priority**: chain rows carry a grip handle; the list order is the routing priority, on the root chain and on every named pool (see [Priority order is drag-and-drop](#priority-order-is-drag-and-drop)).
@@ -221,6 +224,26 @@ The picker then offers three rows: `Auto`, `glm-5.3 → GLM Coding Plan`, `ours 
 
 In the card the **Named pools** section sits right after the default pool's chain editor and before **Advanced**: one collapsible card per pool with an id input and a chain editor (the same row editor as the root chain), plus an add button. It has its own Save/Discard pair and its own validation bucket, so a bad pool id blocks only that section's save.
 
+### Adding a provider that advertises no models
+
+A connector can register a provider for selection while exposing no model list for it. `trae-global` is the common
+example: the Trae connector advertises all three panels (`trae`, `trae-enterprise`, `trae-global`) as configurable
+providers, but only a panel with a signed-in account publishes a model catalog. The provider therefore shows up in the
+dropdown while its model list stays empty.
+
+The chain editor handles that case instead of blocking you:
+
+- When the chosen provider has no catalog group, the model cell becomes a **free-text input** rather than a permanently
+  disabled dropdown, with the hint 「This provider has no model catalog; type the model id directly below.」 Type the
+  model id the connector expects (for example `deepseek-v4.1-flash`) and the row serializes to a normal
+  `trae-global/deepseek-v4.1-flash` selector.
+- A row that names a provider but no model is reported as exactly that — 「Selector "trae-global" names a provider but
+  no model; write it as "trae-global/model-id".」 — instead of the misleading 「Invalid selector」. The same message is
+  used for the root chain, the subagent chain, named pools and time slots.
+- The selector grammar itself is unchanged: a bare provider is still not a routable entry, because the host resolves
+  routes as `provider/model`. Only the input affordance and the diagnosis changed, so every valid configuration keeps
+  working exactly as before.
+
 ## Chain status (which entry is cooling down)
 
 Every chain editor — the default pool's and each named pool's — carries a read-only **chain status** strip above it. It lists the entries in routing order with a state dot, so "first source exhausted, second one answering" is visible at a glance without reading logs:
@@ -236,7 +259,7 @@ Chain status                          In use: Qoder · dfmodel
 - **Cooling down** (amber) is benched and shows when it returns. A bench is normally a timer; with `recovery: "half-open"` it reads **Probing** instead, and `revertPolicy: "never"` shows **Disabled** because that entry is out for the rest of the session.
 - **Standby** (grey) is a healthy entry further down the chain.
 - Every row also carries a small **Bench** (冷却) button on its right — press it to push that one source into cooldown, or press it again (**Release** / 解封) to lift it. See [Benching one source on purpose](#benching-one-source-on-purpose).
-- When *every* entry is benched the strip says so and the engine still tries the first entry directly — that is how a fully-benched chain recovers instead of dead-ending.
+- When *every* entry is benched the strip says so and the engine still walks the chain by trying the entry whose bench **releases soonest** — see [A fully-benched chain still keeps walking](#a-fully-benched-chain-still-keeps-walking).
 
 The strip refreshes every 5 seconds and after every settings change. It is strictly derived from the plugin's own observed request errors: the state is per-agent and never persisted, so a fresh session starts with no cooling entries. Providers do not publish a cross-plugin status API, so each provider's own status detection (WorkBuddy's account pool, Qoder's quota) stays inside that provider — the pool only learns about a failure when a request actually fails.
 
@@ -298,9 +321,26 @@ A bench is not a promise to stay down. Whenever the plugin sees a completed assi
 
 `revertPolicy: "never"` is the exception: it is an explicit request to keep a failed entry out for the rest of the session, so a success does not override it.
 
+### A fully-benched chain still keeps walking
+
+A bench is a *prediction* that a source just broke, not a verdict. So when a failure arrives and **nothing** on the chain is still selectable (everything is cooling down, or already failed inside this step), the plugin does **not** hand you the raw error:
+
+1. Filter candidates the normal way — skip the current route, skip routes already failed in this step, skip routes that cannot hold the context.
+2. If nothing survives, try the entry whose bench **releases soonest**. A source back in 40 seconds is plainly better than one benched for five hours.
+3. Only when even the step-failed set covers the whole chain — the genuine ping-pong case — is the raw failure handed back to the host.
+
+A warn line records it: `every candidate is benched — falling back to <provider>/<model> (soonest release) instead of surfacing the raw failure`. That is why selecting `ModelPool/Auto` does not make the pool one-shot: when one source burns its quota and takes a 5-hour bench, the chain moves on, and the next request picks a different starting point.
+
+Note that **no dispatchable head** and **everything benched** are different conditions. The former (empty chain, wildcard-only rows) still throws `UNDISPATCHABLE_EFFECTIVE_HEAD` / `EMPTY_EFFECTIVE_CHAIN`, because that is a configuration error and retrying it is pointless.
+
 ### Priority order is drag-and-drop
 
-Both the root chain and each named pool's chain are ordered lists, and the order *is* the priority: the first non-benched entry is what you get. Rows can be dragged by the grip handle on the left — pool cards by their header grip, chain entries by the grip in the entry footer — and the change is a normal unsaved edit, so it goes through the section's Save button like any other edit. Dragging is disabled while the settings are read-only.
+Both the root chain and each named pool's chain are ordered lists, and the order *is* the priority: the first non-benched entry is what you get. Every chain is reorderable in the same way, including the **Default pool** section's **Model pool (fallback chain)** editor:
+
+- **Pool cards** (named pools) are dragged by the grip handle in their header.
+- **Chain entries** — the default pool's rows and each named pool's rows — are dragged by the grip in the entry footer.
+
+The change is a normal unsaved edit, so it goes through that section's Save button like any other edit. Dragging is disabled while the settings are read-only, and a chain with a single entry shows no grip at all, since there is nothing to reorder.
 
 ### A manual model choice is never overridden
 
@@ -338,6 +378,22 @@ Two composition caveats:
 ## Fallback triggers (`triggerCodes`)
 
 `fallbacks.triggerCodes` is a plain list of dsh failure codes, and **any** code the harness can report is accepted — not only the three defaults (`AUTH` / `QUOTA` / `RATE_LIMIT`). A failure whose code is not listed passes straight through to llm-retry or to the original error, exactly as if the plugin were not installed. Retryable failures (5xx / `TRANSPORT` / `TIMEOUT` / `EMPTY_RESPONSE`) need no extra entries: llm-retry backs them off first and the failure enters the chain decision the same way once that budget is exhausted.
+
+### Matching is by condition, not by literal spelling
+
+Connectors do not agree on the code they use for the same real-world event: Trae reports lowercase `authentication` / `upstream` / `soft_rate` / `hard_credit`, WorkBuddy reports `busy` / `channel_reject`, the harness itself re-classifies pi-ai failures into bare strings like `AUTH` / `RATE_LIMIT` / `SERVER`, and quota shows up as either `QUOTA` or `ACCOUNT_QUOTA`. Compared literally, your `AUTH` would never meet Trae's `authentication` — **half of a configured trigger list is dead**, which makes the pool look like it is doing nothing at all.
+
+Both sides are therefore normalised before comparison (uppercased, whitespace and hyphens folded to underscores) and synonyms are collapsed:
+
+| Trigger you write | Also catches these real failure codes |
+| --- | --- |
+| `AUTH` | `authentication`, `authorization`, `INVALID_CREDENTIAL`, `ACCOUNT_SIGN_IN_REQUIRED`, `WORKBUDDY_CREDENTIAL_REJECTED`, `unsupported-region`, `UNAUTHORIZED` |
+| `QUOTA` | `ACCOUNT_QUOTA`, `INSUFFICIENT_QUOTA`, `QUOTA_EXCEEDED`, `hard_credit` |
+| `RATE_LIMIT` | `soft_rate`, `TOO_MANY_REQUESTS`, `busy`, `channel_reject` |
+| `SERVER` | `upstream`, `UPSTREAM_ERROR`, `PI_AI_ERROR`, `INTERNAL` |
+| `TRANSPORT` | `STREAM_CLOSED`, `CONNECTION_RESET` |
+
+Codes outside the table keep their meaning (`TIMEOUT`, `EMPTY_RESPONSE`, `CONTEXT_WINDOW_EXCEEDED`, …), so existing configurations do not change semantics — the half that spelling differences used to lock out simply starts working.
 
 ### Context-window rejections
 
