@@ -276,18 +276,33 @@ fallbacks:
 已检测 5 条：3 条连通，1 条已冷却，1 条未判定（未计入冷却）
 ```
 
-只有 provider 侧给出的确定结论（`QUOTA_EXHAUSTED`、`MODEL_NOT_FOUND`、`INVALID_API_KEY`、`AUTH`、`PERMISSION_DENIED` 等）才会真正把一条源打入完整冷却。完整的一次性码表为 `TIMEOUT`、`ABORTED`、`TRANSPORT`、`NETWORK_ERROR`、`ECONNRESET`、`ECONNREFUSED`、`ETIMEDOUT`、`ENOTFOUND`、`EAI_AGAIN`、`EHOSTUNREACH`、`ENETUNREACH`、`RATE_LIMITED`、`RATE_LIMIT`、`RATE_LIMIT_EXCEEDED`、`TOO_MANY_REQUESTS`、`OVERLOADED`、`OVERLOADED_ERROR`、`UNAVAILABLE`、`SERVER`、`SERVER_ERROR`、`INTERNAL_ERROR`、`BAD_GATEWAY`、`SERVICE_UNAVAILABLE`、`UPSTREAM_TIMEOUT`、`UPSTREAM_ERROR`、`EMPTY_RESPONSE`、`ACCOUNT_SIGNED_OUT`。（其中 `RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE` 正是宿主自己判定为可重试的那一组，见 @deepseek-ai/dsh-llm 的 `DEFAULT_RETRYABLE_CODES`。）
+只有 provider 侧给出的确定结论（`QUOTA_EXHAUSTED`、`MODEL_NOT_FOUND`、`AUTH`、`PERMISSION_DENIED` 等）才会真正把一条源打入冷却，而且走的是与真实失败相同的「按账号」窗口——额度类结论只描述一个账号，因此拿到的是下面那个短窗口，而不是完整 `cooldownMs`。完整的一次性码表为 `TIMEOUT`、`ABORTED`、`TRANSPORT`、`NETWORK_ERROR`、`ECONNRESET`、`ECONNREFUSED`、`ETIMEDOUT`、`ENOTFOUND`、`EAI_AGAIN`、`EHOSTUNREACH`、`ENETUNREACH`、`RATE_LIMITED`、`RATE_LIMIT`、`RATE_LIMIT_EXCEEDED`、`TOO_MANY_REQUESTS`、`OVERLOADED`、`OVERLOADED_ERROR`、`UNAVAILABLE`、`SERVER`、`SERVER_ERROR`、`INTERNAL_ERROR`、`BAD_GATEWAY`、`SERVICE_UNAVAILABLE`、`UPSTREAM_TIMEOUT`、`UPSTREAM_ERROR`、`EMPTY_RESPONSE`、`ACCOUNT_SIGNED_OUT`。（其中 `RATE_LIMIT`、`SERVER`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE` 正是宿主自己判定为可重试的那一组，见 @deepseek-ai/dsh-llm 的 `DEFAULT_RETRYABLE_CODES`。）
 
-全局冷却与路由失败共用同一个 `cooldownMs`，所以探测结论与真实失败的过期节奏一致。
+全局冷却与路由失败共用同一个窗口，所以探测结论与真实失败的过期节奏一致。
 
 ### 一次性失败只软冷却
 
 同一条道理也适用于你没有主动检测的那些失败——引擎在真实请求中看到的失败。链头上出现一次 `TIMEOUT` 或 `RATE_LIMIT`，并不足以说明这个源坏了，因此它只换来**一分钟的软冷却**，而不是整个 `cooldownMs`：
 
 - `TRANSIENT_BENCH_MS` 为 60 秒。失败码属于上面那张一次性码表时，冷却时长为 `min(cooldownMs, 60 秒)`；把 `cooldownMs` 调到一分钟以下，软冷却也随之变短。
-- 确定结论（`QUOTA_EXHAUSTED`、`MODEL_NOT_FOUND`、`INVALID_API_KEY`、`AUTH`、密钥被吊销等）保留完整 `cooldownMs`——这类问题一分钟后重试只会再浪费一轮。
 - 请求级失败（`CONTEXT_WINDOW_EXCEEDED`）完全不触碰冷却。
 - 常开模式触到重试上限时的那次决策不带失败码，因此保留完整窗口。
+
+### 额度或凭证失败是一个账号的事，不是整条路由的事
+
+这是最容易被误解的一节，因为它和普通的「降级列表」正好相反。
+
+这个池子接的每个连接器（Qoder、Trae、WorkBuddy……）都自带**自己的账号池**，并且每次请求都会在账号之间轮换。因此一个 `QUOTA`、`AUTH`、`HARD_CREDIT` 或 `INVALID_API_KEY` 抵达插件时，它说的是**某一个账号**的状态，而不是「这条 provider 路由已经死了」。为一纸单账号判决就把整条路由打入 `cooldownMs`，正是让一个很充足的池子报出「当前请求的额度已用尽」的那种误诊。
+
+因此 `ACCOUNT_SCOPED_CODES` 里的码拿到的是一个短得多、按账号计的窗口（`ACCOUNT_BENCH_MS` 为 1 分钟），升级上限是 `ACCOUNT_ESCALATION_CAP_MS`（15 分钟），而不是完整 `cooldownMs`：
+
+| 连续额度/凭证类失败次数 | 冷却时长 |
+| --- | --- |
+| 1 | 1 分钟 |
+| 2 | 2 分钟 |
+| 3 次及以上 | 15 分钟（账号上限） |
+
+这个上限刻意远短于典型 `cooldownMs`（出厂配置里是 5 小时）：连接器自己的账号池回补周期快得多，5 小时冷却会让一个早已恢复的健康源被藏很久。不在这个集合里的码——`MODEL_NOT_FOUND`、`PERMISSION_DENIED`、真正的路由缺陷——仍然拿完整窗口，且永不被软化。
 
 ### 反复的一次性失败要升级，而不是继续软冷却
 
@@ -315,9 +330,10 @@ fallbacks:
 
 1. 先按正常规则筛候选——跳过当前路由、跳过本次 step 已失败的路由、跳过装不下上下文的候选。
 2. 若一个都不剩，就挑**最早解冻**的那一条去试。窗口只剩 40 秒的源，明显好过还要蹲 5 小时的源。
-3. 只有连「本次 step 已失败」的集合都覆盖了整条链（那才是真的打转），才把原始失败交还给宿主。
+3. 若连这一步也挑不出来、且失败是**按账号**性质的，就直接重试当前路由去撞一个新账号：连接器每次调用都会轮换账号，所以一个账号耗尽不是把「额度已用尽」甩给你的理由。
+4. 只有当整条链在本 step 内都试遍、且失败不是按账号性质时，才把原始失败交还给宿主。
 
-日志里会留一行 warn：`every candidate is benched — falling back to <provider>/<model> (soonest release) instead of surfacing the raw failure`。这就是为什么池子不会因为你选 `ModelPool/Auto` 而变成一次性的：某个源额度耗尽、进了 5 小时冷却，链会走到下一个源，下一次再自动换个起点。
+日志里会留两行 warn：第 2 步是 `every candidate is benched — falling back to <provider>/<model> (soonest release) instead of surfacing the raw failure`，第 3 步是 `every candidate is benched after the account-scoped failure <code> — retrying <provider>/<model> for a fresh account instead of surfacing the raw error`。这就是为什么池子不会因为你选 `ModelPool/Auto` 而变成一次性的：某个源额度耗尽、进了冷却，链会走到下一个源，下一次再自动换个起点。
 
 同时，**没有可派发链头**与**全部冷却**是两件事：前者（空链、只有通配符行）仍然抛 `UNDISPATCHABLE_EFFECTIVE_HEAD` / `EMPTY_EFFECTIVE_CHAIN`，因为那是配置错误，重试没有意义。
 
@@ -332,9 +348,11 @@ fallbacks:
 
 ### 手动选择永不被改写
 
-模型池只在它自己拥有的路由上动手。如果你在选择器里选了一个**具体**模型、且它不是全天链的链头，插件就把它视为有意的手动选择，让失败原样交给 llm-retry / 原始错误：不切换、不冷却、不改写重试。把手动选择撬走，正是这一行为要消除的那个毛病。
+模型池只在它自己拥有的路由上动手。如果你在选择器里选了一个**具体**模型、且它**不属于**当前会话所走的任何一条链，插件就把它视为有意的手动选择，让失败原样交给 llm-retry / 原始错误：不切换、不冷却、不改写重试。把手动选择撬走，正是这一行为要消除的那个毛病。
 
-仍属于「池拥有」的情形：虚拟行 `ModelPool/Auto` 与每个 `ModelPool/<池 id>`（它们本身就是路由契约，在它们上面失败正是引擎的职责）、恰好等于当前全天链链头的具体路由，以及任何子代理会话（它的路由来自角色注入，不是人点的）。
+仍属于「池拥有」的情形：虚拟行 `ModelPool/Auto` 与每个 `ModelPool/<池 id>`（它们本身就是路由契约，在它们上面失败正是引擎的职责）、**当前会话所走那条链里的每一个具体路由**——生效 root 链，或会话所选的那个命名池的链——以及任何子代理会话（它的路由来自角色注入，不是人点的）。
+
+第三条对命名池尤其关键：一个 `ModelPool/analyst` 会话走的是 *analyst* 的链，因此链里的 `trae/deepseek-v4.1-flash` 属于池拥有，尽管它不是全天链链头。在这一点被写明之前，命名池会话会把自己链里的成员误判成手动选择，从而完全拒绝切换。
 
 ## 分时槽预设（分时切换）
 

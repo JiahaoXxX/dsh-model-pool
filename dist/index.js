@@ -3576,6 +3576,61 @@ const PROBE_TRANSIENT_CODES = new Set([
   "EMPTY_RESPONSE",
   "ACCOUNT_SIGNED_OUT"
 ]);
+/**
+ * Failure codes that describe ONE ACCOUNT rather than the provider route.
+ *
+ * Every connector here keeps its own multi-account rotation and picks a fresh
+ * account per request (see the "marked out-of-credit by live request" log
+ * lines), so a quota or credential verdict on one account says nothing about
+ * whether the route can serve the NEXT request. Benching the whole route for
+ * the full cooldownMs window is therefore wrong: it drops a healthy source out
+ * of the pool because a single account ran dry.
+ */
+const ACCOUNT_SCOPED_CODES = new Set([
+  "QUOTA",
+  "QUOTA_EXHAUSTED",
+  "QUOTA_EXCEEDED",
+  "ACCOUNT_QUOTA",
+  "INSUFFICIENT_QUOTA",
+  "EXCEEDED_QUOTA",
+  "CREDITS_EXHAUSTED",
+  "OUT_OF_CREDIT",
+  "OUT_OF_CREDITS",
+  "NO_CREDIT",
+  "BILLING_EXCEEDED",
+  "HARD_CREDIT",
+  "AUTH",
+  "AUTHENTICATION",
+  "AUTHORIZATION",
+  "UNAUTHORIZED",
+  "INVALID_CREDENTIAL",
+  "INVALID_API_KEY",
+  "API_KEY_INVALID",
+  "ACCOUNT_SIGN_IN_REQUIRED",
+  "ACCOUNT_SIGNED_OUT",
+  "WORKBUDDY_CREDENTIAL_REJECTED",
+  "UNSUPPORTED_REGION",
+  "RATE_LIMIT",
+  "RATE_LIMITED",
+  "RATE_LIMIT_EXCEEDED",
+  "TOO_MANY_REQUESTS"
+]);
+/**
+ * Soft bench for an account-scoped failure. Deliberately short: the connector
+ * rotates to another account on the next request, so the route is usually
+ * usable again almost immediately. Consecutive failures still escalate to the
+ * full cooldownMs window, so a genuinely dead route ends up benched anyway.
+ */
+const ACCOUNT_BENCH_MS = 6e4;
+/**
+ * Ceiling for an account-scoped streak.
+ *
+ * A route whose accounts are all exhausted is NOT dead for the full cooldownMs:
+ * the connector's own pool refills on a much shorter cycle, so a 5 h bench would
+ * hide a healthy source for hours (the "池子很充足却报额度已用尽" complaint). Cap
+ * the escalation instead, and let the route return to rotation quickly.
+ */
+const ACCOUNT_ESCALATION_CAP_MS = 9e5;
 const REQUEST_SCOPED_CODES = new Set([CONTEXT_WINDOW_EXCEEDED_CODE]);
 const stateStores = new WeakMap();
 function stateStore(ctx) {
@@ -4029,11 +4084,41 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		if (current.model === void 0 || current.model === "") return false;
 		if (isVirtualModelId(config, current.model)) return false;
 		if (agent.session?.header?.origin === "subagent") return false;
+		if (routeInOwnChain(agent, current, config)) return false;
 		const own = routedTargets.get(agent.id);
 		if (own !== void 0 && own.provider === current.provider && own.model === current.model) return false;
 		const head = effectiveHeadOfModel(config, FALLBACKS_CHAIN_MODEL, new Date());
 		if (head !== void 0 && head.provider === current.provider && head.model === current.model) return false;
 		return true;
+	}
+	/**
+	 * True when this route appears in the chain the session is actually riding
+	 * (the named pool it selected, or its effective root chain).
+	 *
+	 * Such a route was put there by the POOL, never chosen by hand, so it must
+	 * stay eligible for a fallback switch. Only a route the user selected from
+	 * outside every chain may claim the "manual pick, do not hijack" protection.
+	 */
+	function routeInOwnChain(agent, current, config) {
+		let chain;
+		try {
+			chain = sessionTail(agent, config);
+		} catch {
+			return false;
+		}
+		if (!Array.isArray(chain)) return false;
+		const wanted = selectorKey(current.provider, current.model);
+		for (const entry of chain) {
+			let selector;
+			try {
+				selector = parseSelector(entry);
+			} catch {
+				continue;
+			}
+			if (selector.model === void 0) continue;
+			if (selectorKey(selector.provider, selector.model) === wanted) return true;
+		}
+		return false;
 	}
 	/** Drop every bench (per-agent + probe-discovered) so the chain is usable again. */
 	/**
@@ -4207,7 +4292,7 @@ function apply(ctx, config = defaultFallbacksConfig) {
 			const ok = outcome.ok;
 			const benched = ok ? false : outcome.conclusive;
 			if (ok) unbench(route.key);
-			else if (benched) bench(route.key, Date.now() + config.cooldownMs);
+			else if (benched) bench(route.key, Date.now() + transientBenchMs(config.cooldownMs, outcome.code, 1));
 			results.push({
 				pool: typeof scope === "string" ? scope : "",
 				provider: route.provider,
@@ -4268,6 +4353,13 @@ function apply(ctx, config = defaultFallbacksConfig) {
 				logger.warn("llm-fallbacks: agent \"%s\" every candidate is benched — falling back to %s/%s (soonest release) instead of surfacing the raw failure", agent.id, leastBad.provider, leastBad.model);
 				first = leastBad;
 			}
+		}
+		if (first === void 0 && current.model !== void 0 && current.model !== "" && isAccountScopedFailure(failureCode)) {
+			logger.warn("llm-fallbacks: agent \"%s\" every candidate is benched after the account-scoped failure %s — retrying %s/%s for a fresh account instead of surfacing the raw error", agent.id, failureCode, current.provider, current.model);
+			first = {
+				provider: current.provider,
+				model: current.model
+			};
 		}
 		const selected = first !== void 0 && surviving.length === 0 ? [first] : surviving;
 		let target;
@@ -4331,12 +4423,24 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	 * an even shorter window can shrink it. Definite verdicts keep the full
 	 * window, and always-cap decisions carry no code so they stay unchanged.
 	 */
+	function isAccountScopedFailure(code) {
+		if (code === void 0 || code === "") return false;
+		const normalized = String(code).toUpperCase().replace(/[\s-]+/g, "_");
+		if (ACCOUNT_SCOPED_CODES.has(normalized)) return true;
+		return ACCOUNT_SCOPED_CODES.has(canonicalTriggerCode(code));
+	}
 	function transientBenchMs(cooldownMs, code, consecutive) {
 		if (code === void 0) return cooldownMs;
 		const normalized = String(code).toUpperCase();
+		const strikes = consecutive ?? 1;
+		if (ACCOUNT_SCOPED_CODES.has(normalized)) {
+			const cap = Math.min(cooldownMs, ACCOUNT_ESCALATION_CAP_MS);
+			if (strikes >= TRANSIENT_ESCALATE_AFTER) return cap;
+			return Math.min(cap, escalatedCooldownMs(Math.min(cap, ACCOUNT_BENCH_MS), strikes));
+		}
 		if (!PROBE_TRANSIENT_CODES.has(normalized)) return cooldownMs;
-		if ((consecutive ?? 1) >= TRANSIENT_ESCALATE_AFTER) return cooldownMs;
-		return Math.min(cooldownMs, escalatedCooldownMs(Math.min(cooldownMs, TRANSIENT_BENCH_MS), consecutive ?? 1));
+		if (strikes >= TRANSIENT_ESCALATE_AFTER) return cooldownMs;
+		return Math.min(cooldownMs, escalatedCooldownMs(Math.min(cooldownMs, TRANSIENT_BENCH_MS), strikes));
 	}
 	function commit(state, pending, turn, step) {
 		const config = source();

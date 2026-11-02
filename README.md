@@ -288,18 +288,33 @@ A connectivity test is deliberately **conservative about what counts as evidence
 Tested 5 routes: 3 reachable, 1 benched, 1 inconclusive (not benched)
 ```
 
-Only a provider-side verdict (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `INVALID_API_KEY`, `AUTH`, `PERMISSION_DENIED`, …) puts a route on a full cooldown. The full transient list is `TIMEOUT`, `ABORTED`, `TRANSPORT`, `NETWORK_ERROR`, `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, `EHOSTUNREACH`, `ENETUNREACH`, `RATE_LIMITED`, `RATE_LIMIT`, `RATE_LIMIT_EXCEEDED`, `TOO_MANY_REQUESTS`, `OVERLOADED`, `OVERLOADED_ERROR`, `UNAVAILABLE`, `SERVER`, `SERVER_ERROR`, `INTERNAL_ERROR`, `BAD_GATEWAY`, `SERVICE_UNAVAILABLE`, `UPSTREAM_TIMEOUT`, `UPSTREAM_ERROR`, `EMPTY_RESPONSE`, `ACCOUNT_SIGNED_OUT`. (`RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT` and `EMPTY_RESPONSE` are exactly the codes the Harness itself treats as retryable — `DEFAULT_RETRYABLE_CODES` in @deepseek-ai/dsh-llm.)
+Only a provider-side verdict (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `AUTH`, `PERMISSION_DENIED`, …) benches a route, and it goes through the same account-aware window as a real failure — a quota verdict describes one account, so it earns the short bench described below rather than the full `cooldownMs`. The full transient list is `TIMEOUT`, `ABORTED`, `TRANSPORT`, `NETWORK_ERROR`, `ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `ENOTFOUND`, `EAI_AGAIN`, `EHOSTUNREACH`, `ENETUNREACH`, `RATE_LIMITED`, `RATE_LIMIT`, `RATE_LIMIT_EXCEEDED`, `TOO_MANY_REQUESTS`, `OVERLOADED`, `OVERLOADED_ERROR`, `UNAVAILABLE`, `SERVER`, `SERVER_ERROR`, `INTERNAL_ERROR`, `BAD_GATEWAY`, `SERVICE_UNAVAILABLE`, `UPSTREAM_TIMEOUT`, `UPSTREAM_ERROR`, `EMPTY_RESPONSE`, `ACCOUNT_SIGNED_OUT`. (`RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT` and `EMPTY_RESPONSE` are exactly the codes the Harness itself treats as retryable — `DEFAULT_RETRYABLE_CODES` in @deepseek-ai/dsh-llm.)
 
-Global benches use the same `cooldownMs` as route failures, so a probe result and a real failure age out together.
+Global benches use the same window as route failures, so a probe result and a real failure age out together.
 
 ### A transient failure gets a soft bench
 
 The same reasoning applies to failures you did not probe for — the ones the engine sees while routing a real request. A `TIMEOUT` or a `RATE_LIMIT` on the head is not evidence that the source is broken, so it earns a **soft bench of one minute**, not a full `cooldownMs`:
 
 - `TRANSIENT_BENCH_MS` is 60 s. A failure whose code is in the transient list above benches the route for `min(cooldownMs, 60 s)`, so shrinking `cooldownMs` below a minute also shrinks the soft bench.
-- Definite verdicts (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `INVALID_API_KEY`, `AUTH`, a rotated key, …) keep the full `cooldownMs` — retrying those in a minute would only burn another turn.
 - A request-scoped failure (`CONTEXT_WINDOW_EXCEEDED`) never touches the cooldown at all.
 - An always-mode retry-cap decision carries no failure code, so it keeps the full window.
+
+### A quota or credential failure is about one account, not the route
+
+This is the part that most often surprises people, because it is the opposite of what a plain "fallback list" does.
+
+Every connector under this pool (Qoder, Trae, WorkBuddy, …) keeps its **own pool of accounts** and rotates between them per request. So a `QUOTA`, `AUTH`, `HARD_CREDIT` or `INVALID_API_KEY` verdict reaching the pool is a statement about **one account**, not a verdict that the provider route is dead. Benching the whole route for `cooldownMs` over it is precisely the misdiagnosis that makes a well-stocked pool report 「当前请求的额度已用尽」.
+
+Codes in `ACCOUNT_SCOPED_CODES` therefore get a much shorter, account-aware window (`ACCOUNT_BENCH_MS` = 1 min), and the streak ceiling is `ACCOUNT_ESCALATION_CAP_MS` (15 min) rather than the full `cooldownMs`:
+
+| consecutive account-scoped failures | bench |
+| --- | --- |
+| 1 | 1 min |
+| 2 | 2 min |
+| 3 and beyond | 15 min (the account ceiling) |
+
+The ceiling is deliberately far shorter than a typical `cooldownMs` (5 h in the shipped profile): the connector's own account pool refills on a much faster cycle, so a five-hour bench would keep a healthy source hidden long after it recovered. A code outside the set — `MODEL_NOT_FOUND`, `PERMISSION_DENIED`, a genuine route defect — still gets the full window and is never softened.
 
 ### A repeated transient failure is promoted, not re-softened
 
@@ -327,9 +342,10 @@ A bench is a *prediction* that a source just broke, not a verdict. So when a fai
 
 1. Filter candidates the normal way — skip the current route, skip routes already failed in this step, skip routes that cannot hold the context.
 2. If nothing survives, try the entry whose bench **releases soonest**. A source back in 40 seconds is plainly better than one benched for five hours.
-3. Only when even the step-failed set covers the whole chain — the genuine ping-pong case — is the raw failure handed back to the host.
+3. If even that yields nothing **and** the failure is account-scoped, retry the current route anyway for a fresh account: the connector rotates accounts on every call, so one exhausted account is not a reason to surface 「额度已用尽」.
+4. Only a genuine step-wide ping-pong on a non-account verdict hands the raw failure back to the host.
 
-A warn line records it: `every candidate is benched — falling back to <provider>/<model> (soonest release) instead of surfacing the raw failure`. That is why selecting `ModelPool/Auto` does not make the pool one-shot: when one source burns its quota and takes a 5-hour bench, the chain moves on, and the next request picks a different starting point.
+A warn line records step 2: `every candidate is benched — falling back to <provider>/<model> (soonest release) instead of surfacing the raw failure`, and step 3: `every candidate is benched after the account-scoped failure <code> — retrying <provider>/<model> for a fresh account instead of surfacing the raw error`. That is why selecting `ModelPool/Auto` does not make the pool one-shot: when one source burns its quota and takes a bench, the chain moves on, and the next request picks a different starting point.
 
 Note that **no dispatchable head** and **everything benched** are different conditions. The former (empty chain, wildcard-only rows) still throws `UNDISPATCHABLE_EFFECTIVE_HEAD` / `EMPTY_EFFECTIVE_CHAIN`, because that is a configuration error and retrying it is pointless.
 
@@ -344,9 +360,11 @@ The change is a normal unsaved edit, so it goes through that section's Save butt
 
 ### A manual model choice is never overridden
 
-The pool engines act only on the routes they own. If you pick a **concrete** model in the picker that is not the head of the all-day chain, the plugin treats it as a deliberate manual choice and lets its failures pass straight through to llm-retry / the original error: no switch, no cooldown, no retry override. Backing off from a manual pick is exactly the hijack this behaviour removes.
+The pool engines act only on the routes they own. If you pick a **concrete** model in the picker that belongs to **no** chain the session is riding, the plugin treats it as a deliberate manual choice and lets its failures pass straight through to llm-retry / the original error: no switch, no cooldown, no retry override. Backing off from a manual pick is exactly the hijack this behaviour removes.
 
-What still counts as pool-owned: the virtual `ModelPool/Auto` row and every `ModelPool/<pool id>` row (those *are* routing contracts, so failures there are what the engine is for), any concrete route that happens to be the current all-day chain head, and any subagent session (its route comes from role injection, not from a human click).
+What still counts as pool-owned: the virtual `ModelPool/Auto` row and every `ModelPool/<pool id>` row (those *are* routing contracts, so failures there are what the engine is for), **every concrete route that appears in the chain the session is actually riding** — the effective root chain, or the named pool the session selected — and any subagent session (its route comes from role injection, not from a human click).
+
+That third point matters for named pools: a `ModelPool/analyst` session walks *analyst*'s chain, so `trae/deepseek-v4.1-flash` sitting in that chain is pool-owned even though it is not the all-day head. Before this was explicit, a named-pool session judged its own chain members to be manual picks and refused to switch at all.
 
 
 ## Time-slot presets
