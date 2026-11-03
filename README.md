@@ -430,6 +430,16 @@ fallbacks:
     - trae-cn/doubao-seed-1.6    # last resort (any model is legal here)
 ```
 
+#### The window a pool row advertises
+
+A virtual row fronts a **whole chain**, and a request may be served by any entry in it. So each row advertises the **smallest** context window among the chain's dispatchable routes — the only number that holds for every hop.
+
+This matters because the host sizes a session against the window it is told, and the compressor on the way upstream does the same. A row that declares no window leaves the harness sizing against a default that can be far larger than the route that actually serves the request; the payload then grows past a smaller route's limit, and the switch that was supposed to save the request fails instead.
+
+Practically: a chain of `trae/deepseek-v4.1-flash` (1,000,000) plus `qoder/dfmodel` (200,000) makes the row advertise **200,000**. That is deliberate. Compressing to the small route's window costs some history; hopping onto that route with an oversized payload costs the whole turn.
+
+When no entry's window can be resolved, the field is omitted rather than guessed — the host rejects a non-integer window outright.
+
 **Ordering — the fallback runs before compaction.** With `CONTEXT_WINDOW_EXCEEDED` in `triggerCodes`, this plugin's `agent/request-error` listener handles the rejection **before** the harness's compaction plugin gets to compact: the conversation moves to the fallback model on the first overflow, and the context is never compacted. Leave the code out of `triggerCodes` if you would rather have compaction tried first.
 
 **Request-scoped switching.** A context-window rejection says the *request* was too big, not that the route is unhealthy. Such a switch is **request-scoped**: the from-route is recorded as failed for the current step (so the step does not bounce straight back to it) and still counts against `maxSwitchesPerStep`, but it is **not** put on cooldown for `cooldownMs` and does not feed the half-open recovery counter — the next, shorter prompt goes to the primary model as usual, and no half-open probe is spent on a route that never failed. Every other trigger code stays **route-scoped** (cooldown + recovery bookkeeping) exactly as before.

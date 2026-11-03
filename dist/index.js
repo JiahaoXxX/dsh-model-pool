@@ -3203,6 +3203,12 @@ async function poolSnapshotOf(llm, config, chain, now, signal) {
 		if (info !== void 0) infos.set(selectorKey(entry.provider, entry.model), info);
 	}));
 	const headInfo = head === void 0 ? void 0 : infos.get(selectorKey(head.provider, head.model));
+	const routeWindows = [];
+	for (const entry of entries) {
+		const width = infos.get(selectorKey(entry.provider, entry.model))?.context?.contextWindow;
+		if (Number.isInteger(width) && width > 0) routeWindows.push(width);
+	}
+	const minContextWindow = routeWindows.length === 0 ? void 0 : Math.min(...routeWindows);
 	const perRoute = new Map();
 	const unionIds = new Set();
 	let everyRouteDisablesThinking = entries.length > 0;
@@ -3236,6 +3242,7 @@ async function poolSnapshotOf(llm, config, chain, now, signal) {
 		at: now.getTime(),
 		head,
 		headInfo,
+		minContextWindow,
 		perRoute,
 		efforts,
 		...efforts.length === 0 ? {} : { reasoning: { efforts } }
@@ -3293,6 +3300,22 @@ function cachedPoolSnapshot(config, now, model) {
 	const entries = dispatchableEntries(chain, POOL_EFFORT_UNION_MAX_ENTRIES);
 	if (entries.length === 0) return void 0;
 	return poolSnapshots.get(entries.map((entry) => selectorKey(entry.provider, entry.model)).join("|"))?.snapshot;
+}
+/**
+ * The window a picker row may honestly promise.
+ *
+ * A row fronts a whole chain, and the chain may hop anywhere, so the row
+ * advertises the SMALLEST window among its dispatchable routes. Undefined when
+ * no route could be resolved — the host rejects a non-integer window outright,
+ * so an unknown window must be omitted rather than guessed.
+ */
+async function rowContextWindow(llm, config, model, now, tz) {
+	try {
+		const chain = chainForModel(config, model, now, tz);
+		return (await poolSnapshotOf(llm, config, chain, now))?.minContextWindow;
+	} catch {
+		return;
+	}
 }
 function envelopeProvenance(replayState) {
 	if (typeof replayState !== "object" || replayState === null) return void 0;
@@ -3356,10 +3379,13 @@ var ModelPoolAdapter = class extends LlmAdapter {
 		const isCooling = this.coolingPredicate(config);
 		const head = effectiveHeadOf(config, now, isCooling);
 		const display = head === void 0 ? void 0 : await resolveHeadDisplayName(llm, head);
+		const tz = config.tz ?? "Asia/Shanghai";
+		const autoWindow = await rowContextWindow(llm, config, FALLBACKS_CHAIN_MODEL, now, tz);
 		const rows = [{
 			provider,
 			id: FALLBACKS_CHAIN_MODEL,
-			name: pickerDisplayName(config, now, display, isCooling)
+			name: pickerDisplayName(config, now, display, isCooling),
+			...autoWindow === void 0 ? {} : { contextWindow: autoWindow }
 		}];
 		const seenIds = new Set([FALLBACKS_CHAIN_MODEL]);
 		for (const pool of config.pools ?? []) {
@@ -3369,10 +3395,12 @@ var ModelPoolAdapter = class extends LlmAdapter {
 			seenIds.add(id);
 			const poolHead = effectiveHeadOfModel(config, pool.id, now, isCooling);
 			const poolDisplay = poolHead === void 0 ? void 0 : await providerDisplayName(llm, poolHead.provider) ?? await resolveHeadDisplayName(llm, poolHead);
+			const poolWindow = await rowContextWindow(llm, config, id, now, tz);
 			rows.push({
 				provider,
 				id,
-				name: poolPickerDisplayName(config, pool, now, poolDisplay, isCooling)
+				name: poolPickerDisplayName(config, pool, now, poolDisplay, isCooling),
+				...poolWindow === void 0 ? {} : { contextWindow: poolWindow }
 			});
 		}
 		return rows;
@@ -3383,13 +3411,14 @@ var ModelPoolAdapter = class extends LlmAdapter {
 		const chain = chainForModel(config, model, now, config.tz ?? "Asia/Shanghai");
 		const snapshot = await poolSnapshotOf(this.getLlm(), config, chain, now, signal);
 		const info = snapshot.headInfo;
+		const contextWindow = snapshot.minContextWindow ?? info?.context?.contextWindow;
 		return {
 			provider,
 			id: model,
 			name: info?.name ?? model,
 			...info?.description === void 0 ? {} : { description: info.description },
 			...info?.inputModalities === void 0 ? {} : { inputModalities: info.inputModalities },
-			...info?.context === void 0 ? {} : { context: info.context },
+			...contextWindow === void 0 ? {} : { context: { contextWindow } },
 			...info?.defaultMaxTokens === void 0 ? {} : { defaultMaxTokens: info.defaultMaxTokens },
 			...snapshot.reasoning === void 0 ? {} : { reasoning: snapshot.reasoning }
 		};
