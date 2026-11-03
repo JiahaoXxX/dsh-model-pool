@@ -158,6 +158,7 @@ Save the config and restart the session, then type `/fallbacks` — the read-onl
 - **Cooldown and revert**: failed / switched-away models are not re-selected during cooldown; `revertPolicy: cooldown-expiry` returns to the primary model automatically.
 - **A fully-benched chain still keeps walking**: when nothing on the chain is selectable, the plugin does not hand you the raw error — it tries the entry whose bench expires **soonest**, because a source back in 40 seconds beats one benched for five hours. Only when even the step-failed set covers the whole chain is the failure returned (see [A fully-benched chain still keeps walking](#a-fully-benched-chain-still-keeps-walking)).
 - **Triggers match by condition, not literal**: `AUTH` also catches Trae's `authentication`, `QUOTA` catches `ACCOUNT_QUOTA` / `hard_credit`, `SERVER` catches lowercase `upstream` — spelling differences between connectors no longer silently disable half of the trigger table (see [Matching is by condition, not by literal spelling](#matching-is-by-condition-not-by-literal-spelling)).
+- **A blip retries the same source before switching**: a failure a fresh account can cure (`QUOTA`, `AUTH`, `HARD_CREDIT`, `RATE_LIMIT`, and the transient codes) is absorbed by retrying the SAME provider up to `SAME_ROUTE_RETRIES` (3) times — its own account rotation answers — instead of hopping to the next source on the first error. A verdict about the request or the route itself (`INVALID_REQUEST`, `CONTEXT_WINDOW_EXCEEDED`, `NO_ADAPTER`, `MODEL_NOT_FOUND`) still switches immediately. An in-place retry never benches the route it hands straight back and is not counted as a switch, so a warm prompt cache survives a hiccup (see [A blip retries the same source before it switches](#a-blip-retries-the-same-source-before-it-switches)).
 - **Transient failures get a soft bench, and success releases it**: a failure the Harness itself calls retryable (`TIMEOUT`, `TRANSPORT`, `RATE_LIMIT`, `SERVER`, `EMPTY_RESPONSE`, …) benches a route for one minute rather than the whole `cooldownMs`; a definite verdict (`QUOTA_EXHAUSTED`, `MODEL_NOT_FOUND`, `INVALID_API_KEY`, …) keeps the full window. Any completed answer from a benched route drops its bench immediately — in `timer` mode too, so a working provider is never stuck out the window. A route that keeps failing is promoted instead of re-softened: the third consecutive transient strike earns the full `cooldownMs`, so the chain stops oscillating between two sources (see [A transient failure gets a soft bench](#a-transient-failure-gets-a-soft-bench), [A repeated transient failure is promoted, not re-softened](#a-repeated-transient-failure-is-promoted-not-re-softened) and [A success releases the bench immediately](#a-success-releases-the-bench-immediately)).
 - **Manual choice wins**: a concrete model you picked yourself that is not the all-day chain head is left alone — its failures pass through to llm-retry / the original error with no switch, no cooldown and no retry override. Only the virtual `ModelPool/*` rows, the current chain head, and subagent dispatches are pool-owned — and a route the plugin itself installed is never mistaken for a manual pick, so a pool keeps walking to the last entry instead of getting pinned mid-chain (see [A manual model choice is never overridden](#a-manual-model-choice-is-never-overridden)).
 - **Catalog-less providers can still be used**: when a provider is selectable but publishes no model list (`trae-global` is the common case), the chain editor offers a free-text model field instead of a disabled dropdown, and a row missing its model is reported as a missing model rather than an invalid selector (see [Adding a provider that advertises no models](#adding-a-provider-that-advertises-no-models)).
@@ -315,6 +316,24 @@ Codes in `ACCOUNT_SCOPED_CODES` therefore get a much shorter, account-aware wind
 | 3 and beyond | 15 min (the account ceiling) |
 
 The ceiling is deliberately far shorter than a typical `cooldownMs` (5 h in the shipped profile): the connector's own account pool refills on a much faster cycle, so a five-hour bench would keep a healthy source hidden long after it recovered. A code outside the set — `MODEL_NOT_FOUND`, `PERMISSION_DENIED`, a genuine route defect — still gets the full window and is never softened.
+
+### A blip retries the same source before it switches
+
+Benching is only half of it. Even a one-minute bench is too eager if the pool **hops to another source on the very first error**, because a hop costs the upstream prompt cache and, between providers running different models, can change the model mid-session. What you actually want is to switch when a source is *exhausted*, not when it hiccups.
+
+Every connector here rotates between its own accounts per request, so a retry on the **same** provider is not a wasted round trip — it lands on the next account. `shouldRetrySameRoute` therefore absorbs a failure in place up to `SAME_ROUTE_RETRIES` (3) times before the pool treats the source as exhausted and switches:
+
+| failure code | what the pool does |
+| --- | --- |
+| `QUOTA`, `AUTH`, `HARD_CREDIT`, `RATE_LIMIT`, … (`ACCOUNT_SCOPED_CODES`) | retry the same source, so its own rotation can answer |
+| `TIMEOUT`, `TRANSPORT`, `SERVER`, `EMPTY_RESPONSE`, … (transient) | retry the same source |
+| `INVALID_REQUEST`, `CONTEXT_WINDOW_EXCEEDED`, `NO_ADAPTER`, `MODEL_NOT_FOUND` | switch immediately — another account cannot cure these |
+
+The two columns follow the same split as the bench windows above: only a failure a *fresh account* can cure is worth retrying in place; a verdict about the request or the route itself is not.
+
+An in-place retry is deliberately **not a downgrade**: it does not bench the route it is handing straight back (otherwise a single blip would take a healthy source out of rotation for a minute and immediately re-route around it), and it is not recorded as a switch. It does consume one of `maxSwitchesPerStep` attempts, so a pathological route cannot loop forever, and the per-route retry ledger resets whenever the `(turn, step)` pair changes.
+
+The result is the behaviour you want from a pool: `trae` gets one bad request, retries itself, and the session stays on `trae` with a warm prompt cache. Only when its accounts are genuinely spent does the next request land on `workbuddy`.
 
 ### A repeated transient failure is promoted, not re-softened
 

@@ -1554,6 +1554,7 @@ var FallbackStateStore = class {
 		stepFailures.step = step;
 		stepFailures.failed.reset();
 		stepFailures.switchCount = 0;
+		if (stepFailures.retries !== void 0) stepFailures.retries.clear();
 	}
 	recordFailure(state, key) {
 		state.stepFailures.failed.add(key);
@@ -3661,6 +3662,44 @@ const ACCOUNT_BENCH_MS = 6e4;
  */
 const ACCOUNT_ESCALATION_CAP_MS = 9e5;
 const REQUEST_SCOPED_CODES = new Set([CONTEXT_WINDOW_EXCEEDED_CODE]);
+
+/**
+ * How many times a failing source is retried IN PLACE before the pool treats it
+ * as exhausted and hops to the next source.
+ *
+ * Every connector here keeps its own multi-account rotation and picks an account
+ * per request (the first member its own pool has not marked out-of-credit), so a
+ * retry on the SAME provider is not a wasted round trip — it lands on the next
+ * account. Only when that rotation runs dry does a hop to another source buy
+ * anything, while a hop always costs the upstream prompt cache and can change
+ * models mid-session.
+ *
+ * ponytail: fixed at three attempts, i.e. one per account in the usual two-to-
+ * three account pool. Promote to a config key if a route ever needs its own
+ * budget, instead of raising the constant.
+ */
+const SAME_ROUTE_RETRIES = 3;
+/**
+ * Whether a failure should be absorbed by retrying the SAME source rather than
+ * switching away from it.
+ *
+ * True for the two classes a fresh account on the same route can actually fix:
+ * an account-scoped verdict (quota / credential / rate limit — the connector
+ * rotates accounts) and a transient blip (timeout / transport / 5xx / empty
+ * response). False for verdicts about the REQUEST or the route itself (a
+ * rejected payload, an exhausted context window, a missing adapter) — another
+ * account does not cure those, so they keep switching immediately.
+ */
+function shouldRetrySameRoute(code) {
+	if (code === void 0) return false;
+	const normalized = String(code).toUpperCase();
+	if (REQUEST_SCOPED_CODES.has(normalized)) return false;
+	if (ACCOUNT_SCOPED_CODES.has(normalized)) return true;
+	if (PROBE_TRANSIENT_CODES.has(normalized)) return true;
+	const canonical = canonicalTriggerCode(code);
+	return ACCOUNT_SCOPED_CODES.has(canonical) || PROBE_TRANSIENT_CODES.has(canonical);
+}
+
 const stateStores = new WeakMap();
 function stateStore(ctx) {
 	return stateStores.get(ctx);
@@ -4474,7 +4513,14 @@ function apply(ctx, config = defaultFallbacksConfig) {
 	function commit(state, pending, turn, step) {
 		const config = source();
 		const fromKey = selectorKey(pending.from.provider, pending.from.model);
+		const toKey = selectorKey(pending.to.provider, pending.to.model);
 		states.syncStep(state, turn, step);
+		if (fromKey === toKey) {
+			states.recordFailure(state, fromKey);
+			states.recordSwitch(state);
+			notifyAdaptersUpdated();
+			return;
+		}
 		states.writePending(state, pending);
 		const consecutive = state.recovery.recordFailure(fromKey);
 		if ((pending.scope ?? "route") === "route") {
@@ -4549,6 +4595,31 @@ function apply(ctx, config = defaultFallbacksConfig) {
 		if (!current.model) return next();
 		if (manualChoiceWins(agent, current, config)) return next();
 		rememberServedPool(servedPools, agent, config);
+		if (shouldRetrySameRoute(failure.code)) {
+			const retryState = states.get(agent.id);
+			states.syncStep(retryState, turn, step);
+			retryState.stepFailures.retries ?? (retryState.stepFailures.retries = new Map());
+			const retryKey = selectorKey(current.provider, current.model);
+			const used = retryState.stepFailures.retries.get(retryKey) ?? 0;
+			if (used < SAME_ROUTE_RETRIES && retryState.stepFailures.switchCount < config.maxSwitchesPerStep) {
+				retryState.stepFailures.retries.set(retryKey, used + 1);
+				retryState.stepFailures.switchCount += 1;
+				states.writePending(retryState, {
+					from: {
+						provider: current.provider,
+						model: current.model
+					},
+					to: {
+						provider: current.provider,
+						model: current.model
+					}
+				});
+				logger.warn("llm-fallbacks: agent \"%s\" %s/%s failed with %s (%d/%d on this source) — retrying the SAME source so its own account rotation can answer, instead of switching", agent.id, current.provider, current.model, failure.code, used + 1, SAME_ROUTE_RETRIES);
+				return { kind: "retry" };
+			}
+			logger.warn("llm-fallbacks: agent \"%s\" %s/%s failed with %s after %d in-place retries — treating the source as exhausted and switching", agent.id, current.provider, current.model, failure.code, used);
+		}
+
 		try {
 			const pending = await decide(agent, turn, step, current, "trigger-code", states.peek(agent.id), failure.code);
 			if (pending === null) {
